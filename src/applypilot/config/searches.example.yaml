@@ -54,21 +54,26 @@ queries:
   - query: "security engineer"
     tier: 3
 
-# Locations to search
+# Discovery-time location gate (JobSpy, Workday API, smart-extract).
+# Default: keep only roles that are clearly fully remote OR in Austin, Texas
+# (normalized matching for "Austin, TX", "Austin, Texas", etc.).
+# Set strict_austin_remote: false to use legacy accept/reject patterns under `location:` instead.
+discovery_location:
+  strict_austin_remote: true
+
+# Locations to search (JobSpy query scope)
 locations:
-  - location: "San Francisco, CA"
+  - location: "Austin, TX"
     remote: false
   - location: "Remote"
     remote: true
 
-# Location filtering -- accept/reject patterns for job location text
+# Legacy: only used when discovery_location.strict_austin_remote is false
 location:
   accept_patterns:
-    - "San Francisco"
-    - "Bay Area"
-    - "SF"
-    - "California"
-    - "CA"
+    - "Austin"
+    - "Texas"
+    - "TX"
     - "Remote"
     - "Anywhere"
     - "United States"

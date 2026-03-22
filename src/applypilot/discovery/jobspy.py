@@ -16,8 +16,30 @@ from jobspy import scrape_jobs
 
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.discovery.location_filter import (
+    evaluate_discovery_location,
+    legacy_location_ok,
+    use_legacy_location_lists,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _clean_jobspy_url(value) -> str | None:
+    """Normalize JobSpy URL fields: never store str(None) or 'nan' as real URLs."""
+    if value is None:
+        return None
+    try:
+        import math
+
+        if isinstance(value, float) and math.isnan(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "null", "undefined"):
+        return None
+    return s
 
 
 # -- Proxy parsing -----------------------------------------------------------
@@ -83,36 +105,69 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
     """
     accept = search_cfg.get("location_accept", [])
     reject = search_cfg.get("location_reject_non_remote", [])
+    # Also support nested `location: { accept_patterns: ... }` from searches.example.yaml
+    nested = search_cfg.get("location") or {}
+    if isinstance(nested, dict):
+        if not accept:
+            accept = nested.get("accept_patterns", [])
+        if not reject:
+            reject = nested.get("reject_patterns", [])
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
-    """Check if a job location passes the user's location filter.
+def _normalize_jobspy_defaults(search_cfg: dict) -> dict:
+    """Merge top-level `country` into defaults and ensure country_indeed is set for JobSpy.
 
-    Remote jobs are always accepted. Non-remote jobs must match an accept
-    pattern and not match a reject pattern.
+    python-jobspy requires `country_indeed` (Indeed/Glassdoor scope). The YAML often
+    uses `country: USA` at the top level — map that into defaults.
     """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
+    defaults = dict(search_cfg.get("defaults") or {})
+    if defaults.get("country_indeed"):
+        return defaults
+    raw = (search_cfg.get("country") or "").strip().lower()
+    if raw in ("usa", "us", "united states"):
+        defaults["country_indeed"] = "usa"
+    elif raw:
+        # Pass through (e.g. canada) — JobSpy validates against its Country enum
+        defaults["country_indeed"] = raw.replace(" ", "_")
+    else:
+        defaults.setdefault("country_indeed", "usa")
+    return defaults
 
-    loc = location.lower()
 
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
+def _effective_jobspy_location(search: dict, defaults: dict) -> str:
+    """Location string passed to JobSpy.
 
-    # Reject non-remote matches
-    for r in reject:
-        if r.lower() in loc:
-            return False
+    For **remote** rows, using the literal \"Remote\" pulls global listings; JobSpy can
+    also crash when a posting resolves to an unsupported country (e.g. Dominican Republic).
+    When targeting the US, prefer a US-wide location + ``is_remote=True`` instead.
+    """
+    loc = search.get("location") or ""
+    if not search.get("remote"):
+        return loc
+    # Explicit override in searches.yaml: defaults.remote_location_string: "Remote"
+    if "remote_location_string" in defaults:
+        override = defaults.get("remote_location_string")
+        if override is None or override == "":
+            return loc
+        return str(override)
+    ci = (defaults.get("country_indeed") or "usa").lower()
+    if ci in ("usa", "us", "united_states", "united states"):
+        return defaults.get("remote_us_location") or "United States"
+    return loc
 
-    # Accept matches
-    for a in accept:
-        if a.lower() in loc:
-            return True
 
-    # No match -- reject unknown
-    return False
+def _filter_jobspy_dataframe(df, accept_locs: list[str], reject_locs: list[str], legacy_location: bool):
+    """Apply discovery location rules before storing JobSpy results."""
+
+    def _row_keep(row) -> bool:
+        loc = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
+        is_remote = bool(row.get("is_remote", False))
+        if legacy_location:
+            return legacy_location_ok(loc, accept_locs, reject_locs)
+        return evaluate_discovery_location(loc, is_remote_jobspy=is_remote).keep
+
+    return df[df.apply(_row_keep, axis=1)]
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
@@ -124,8 +179,8 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
     existing = 0
 
     for _, row in df.iterrows():
-        url = str(row.get("job_url", ""))
-        if not url or url == "nan":
+        url = _clean_jobspy_url(row.get("job_url"))
+        if not url:
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
@@ -163,8 +218,8 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             full_description = description
             detail_scraped_at = now
 
-        # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        # Extract apply URL if JobSpy provided it (avoid str(None) → "None" in SQLite)
+        apply_url = _clean_jobspy_url(row.get("job_url_direct"))
 
         try:
             conn.execute(
@@ -195,6 +250,7 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    legacy_location: bool,
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -202,36 +258,45 @@ def _run_one_search(
     if "tier" in s:
         label += f" [tier {s['tier']}]"
 
+    jobspy_loc = _effective_jobspy_location(s, defaults)
+    if jobspy_loc != s.get("location"):
+        label += f" [jobspy_loc={jobspy_loc!r}]"
+
     # Split sites: Glassdoor needs simplified location, others use original
-    gd_location = glassdoor_map.get(s["location"], s["location"].split(",")[0])
+    gd_location = glassdoor_map.get(s["location"], jobspy_loc.split(",")[0])
     has_glassdoor = "glassdoor" in sites
     other_sites = [si for si in sites if si != "glassdoor"]
 
     all_dfs = []
+    country_indeed = defaults.get("country_indeed", "usa")
 
-    # Run non-Glassdoor sites with original location
+    # Run non-Glassdoor sites one at a time so one bad board doesn't fail the whole crawl
+    # (e.g. JobSpy Country.from_string errors on rare location strings from LinkedIn).
     if other_sites:
-        kwargs = {
-            "site_name": other_sites,
+        base_kwargs = {
             "search_term": s["query"],
-            "location": s["location"],
+            "location": jobspy_loc,
             "results_wanted": results_per_site,
             "hours_old": hours_old,
             "description_format": "markdown",
-            "country_indeed": defaults.get("country_indeed", "usa"),
+            "country_indeed": country_indeed,
             "verbose": 0,
         }
         if s.get("remote"):
-            kwargs["is_remote"] = True
+            base_kwargs["is_remote"] = True
         if proxy_config:
-            kwargs["proxies"] = [proxy_config["jobspy"]]
-        if "linkedin" in other_sites:
-            kwargs["linkedin_fetch_description"] = True
-        try:
-            df = _scrape_with_retry(kwargs, max_retries=max_retries)
-            all_dfs.append(df)
-        except Exception as e:
-            log.error("[%s] (non-gd): %s", label, e)
+            base_kwargs["proxies"] = [proxy_config["jobspy"]]
+
+        for site in other_sites:
+            kwargs = {**base_kwargs, "site_name": [site]}
+            if site == "linkedin":
+                kwargs["linkedin_fetch_description"] = True
+            try:
+                df = _scrape_with_retry(kwargs, max_retries=max_retries)
+                if df is not None and len(df) > 0:
+                    all_dfs.append(df)
+            except Exception as e:
+                log.error("[%s] site=%s: %s", label, site, e)
 
     # Run Glassdoor separately with simplified location
     if has_glassdoor:
@@ -242,6 +307,7 @@ def _run_one_search(
             "results_wanted": results_per_site,
             "hours_old": hours_old,
             "description_format": "markdown",
+            "country_indeed": country_indeed,
             "verbose": 0,
         }
         if s.get("remote"):
@@ -250,7 +316,8 @@ def _run_one_search(
             gd_kwargs["proxies"] = [proxy_config["jobspy"]]
         try:
             gd_df = _scrape_with_retry(gd_kwargs, max_retries=max_retries)
-            all_dfs.append(gd_df)
+            if gd_df is not None and len(gd_df) > 0:
+                all_dfs.append(gd_df)
         except Exception as e:
             log.error("[%s] (glassdoor): %s", label, e)
 
@@ -268,12 +335,9 @@ def _run_one_search(
         log.info("[%s] 0 results", label)
         return {"new": 0, "existing": 0, "errors": 0, "filtered": 0, "total": 0, "label": label}
 
-    # Filter by location before storing
+    # Filter by location before storing (discovery gate — not scoring)
     before = len(df)
-    df = df[df.apply(lambda row: _location_ok(
-        str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-        accept_locs, reject_locs,
-    ), axis=1)]
+    df = _filter_jobspy_dataframe(df, accept_locs, reject_locs, legacy_location)
     filtered = before - len(df)
 
     conn = get_connection()
@@ -344,6 +408,11 @@ def search_jobs(
         for site, count in site_counts.items():
             log.info("  %s: %d", site, count)
 
+    search_cfg = config.load_search_config()
+    accept_locs, reject_locs = _load_location_config(search_cfg)
+    legacy_location = use_legacy_location_lists(search_cfg)
+    df = _filter_jobspy_dataframe(df, accept_locs, reject_locs, legacy_location)
+
     conn = init_db()
     new, existing = store_jobspy_results(conn, df, query)
     log.info("Stored: %d new, %d already in DB", new, existing)
@@ -374,9 +443,14 @@ def _full_crawl(
     # Build search combinations from config
     queries = search_cfg.get("queries", [])
     locs = search_cfg.get("locations", [])
-    defaults = search_cfg.get("defaults", {})
+    defaults = _normalize_jobspy_defaults(search_cfg)
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
+    legacy_location = use_legacy_location_lists(search_cfg)
+    if legacy_location:
+        log.info("JobSpy discovery: legacy YAML location_accept / reject patterns")
+    else:
+        log.info("JobSpy discovery: strict location gate (Remote or Austin, TX only)")
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -396,8 +470,10 @@ def _full_crawl(
     proxy_config = parse_proxy(proxy) if proxy else None
 
     log.info("Full crawl: %d search combinations", len(searches))
-    log.info("Sites: %s | Results/site: %d | Hours old: %d",
-             ", ".join(sites), results_per_site, hours_old)
+    log.info(
+        "Sites: %s | Results/site: %d | Hours old: %d | country_indeed=%s",
+        ", ".join(sites), results_per_site, hours_old, defaults.get("country_indeed", "usa"),
+    )
 
     # Ensure DB schema is ready
     init_db()
@@ -412,6 +488,7 @@ def _full_crawl(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map,
+            legacy_location,
         )
         completed += 1
         total_new += result["new"]
@@ -461,9 +538,11 @@ def run_discovery(cfg: dict | None = None) -> dict:
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
-    results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
-    hours_old = cfg.get("defaults", {}).get("hours_old", 72)
+    # searches.example.yaml uses `boards:`; older configs may use `sites:`
+    sites = cfg.get("sites") or cfg.get("boards")
+    defaults_merged = _normalize_jobspy_defaults(cfg)
+    results_per_site = defaults_merged.get("results_per_site", 100)
+    hours_old = defaults_merged.get("hours_old", 72)
     tiers = cfg.get("tiers")
     locations = cfg.get("location_labels")
 

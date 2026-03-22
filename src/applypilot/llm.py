@@ -2,13 +2,14 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
-  OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
+  OPENAI_API_KEY  -> OpenAI Chat Completions (default: gpt-4o-mini) — used when set
+  GEMINI_API_KEY  -> Google Gemini native generateContent (default: gemini-2.5-flash) — if no OpenAI key
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
 LLM_MODEL env var overrides the model name for any provider.
 """
 
+import copy
 import logging
 import os
 import time
@@ -16,6 +17,37 @@ import time
 import httpx
 
 log = logging.getLogger(__name__)
+
+# Gemini REST base (generateContent: .../models/{model}:generateContent)
+_GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+# Official OpenAI API — use Chat Completions fields this API expects (not Gemini).
+_OPENAI_API_HOST = "api.openai.com"
+
+
+def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
+    """Build Chat Completions messages: string ``content`` only, valid roles."""
+    allowed = frozenset({"system", "user", "assistant", "developer"})
+    out: list[dict] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = (m.get("role") or "user").strip()
+        if role not in allowed:
+            role = "user"
+        raw = m.get("content")
+        if raw is None:
+            text = ""
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            text = str(raw)
+        out.append({"role": role, "content": text})
+    return out
+
+
+def _is_openai_official_api(base_url: str) -> bool:
+    return _OPENAI_API_HOST in (base_url or "")
 
 # ---------------------------------------------------------------------------
 # Provider detection
@@ -32,18 +64,20 @@ def _detect_provider() -> tuple[str, str, str]:
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
-    if gemini_key and not local_url:
-        return (
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
-            gemini_key,
-        )
-
+    # Prefer OpenAI when OPENAI_API_KEY is set (scoring + all LLM stages use this client).
     if openai_key and not local_url:
         return (
             "https://api.openai.com/v1",
             model_override or "gpt-4o-mini",
             openai_key,
+        )
+
+    if gemini_key and not local_url:
+        # Native Gemini REST API (generateContent), not the OpenAI-compat proxy.
+        return (
+            _GEMINI_NATIVE_BASE,
+            model_override or "gemini-2.5-flash",
+            gemini_key,
         )
 
     if local_url:
@@ -55,7 +89,7 @@ def _detect_provider() -> tuple[str, str, str]:
 
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set OPENAI_API_KEY, GEMINI_API_KEY, or LLM_URL in your environment."
     )
 
 
@@ -71,27 +105,16 @@ _TIMEOUT = 120  # seconds
 _RATE_LIMIT_BASE_WAIT = 10
 
 
-_GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
-_GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
-
-
 class LLMClient:
-    """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
-
-    For Gemini keys, starts on the OpenAI-compat layer. On a 403 (which
-    happens with preview/experimental models not exposed via compat), it
-    automatically switches to the native generateContent API and stays there
-    for the lifetime of the process.
-    """
+    """Thin LLM client: native Gemini generateContent, or OpenAI-compat (OpenAI / local)."""
 
     def __init__(self, base_url: str, model: str, api_key: str) -> None:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
         self._client = httpx.Client(timeout=_TIMEOUT)
-        # True once we've confirmed the native Gemini API works for this model
-        self._use_native_gemini: bool = False
-        self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        # Gemini via GEMINI_API_KEY uses _GEMINI_NATIVE_BASE + generateContent only.
+        self._gemini_native = base_url.rstrip("/") == _GEMINI_NATIVE_BASE.rstrip("/")
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -101,13 +124,9 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """Call the native Gemini generateContent API.
+        """Call the native Gemini generateContent API (v1beta).
 
-        Used automatically when the OpenAI-compat endpoint returns 403,
-        which happens for preview/experimental models not exposed via compat.
-
-        Converts OpenAI-style messages to Gemini's contents/systemInstruction
-        format transparently.
+        Converts OpenAI-style messages to ``contents`` + optional ``systemInstruction``.
         """
         contents: list[dict] = []
         system_parts: list[dict] = []
@@ -142,9 +161,14 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(
+                f"Unexpected Gemini generateContent response shape: {data!r}"
+            ) from e
 
-    # -- OpenAI-compat API --------------------------------------------------
+    # -- OpenAI-compatible Chat Completions (OpenAI cloud, local Ollama, etc.) ---
 
     def _chat_compat(
         self,
@@ -152,36 +176,52 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """Call the OpenAI-compatible endpoint."""
+        """POST /v1/chat/completions — OpenAI official vs local differ on token limit key."""
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        msgs = _normalize_openai_messages(copy.deepcopy(messages))
+
+        # Official OpenAI: prefer max_completion_tokens (max_tokens can 400 on newer API).
+        # Local servers (Ollama, llama.cpp) typically expect max_tokens.
+        if _is_openai_official_api(self.base_url):
+            payload: dict = {
+                "model": self.model,
+                "messages": msgs,
+                "temperature": temperature,
+                "max_completion_tokens": max_tokens,
+            }
+        else:
+            payload = {
+                "model": self.model,
+                "messages": msgs,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
 
         resp = self._client.post(
-            f"{self.base_url}/chat/completions",
+            f"{self.base_url.rstrip('/')}/chat/completions",
             json=payload,
             headers=headers,
         )
-
-        # 403 on Gemini compat = model not available on compat layer.
-        # Raise a specific sentinel so chat() can switch to native API.
-        if resp.status_code == 403 and self._is_gemini:
-            raise _GeminiCompatForbidden(resp)
 
         return self._handle_compat_response(resp)
 
     @staticmethod
     def _handle_compat_response(resp: httpx.Response) -> str:
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            _log_openai_error_body(resp)
+            resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        msg = data.get("choices", [{}])[0].get("message") or {}
+        content = msg.get("content")
+        if content is None:
+            log.warning("Chat completions: missing message.content in response: %r", data)
+            return ""
+        if not isinstance(content, str):
+            return str(content)
+        return content
 
     # -- public API ---------------------------------------------------------
 
@@ -201,30 +241,9 @@ class LLMClient:
 
         for attempt in range(_MAX_RETRIES):
             try:
-                # Route to native Gemini if we've already confirmed it's needed
-                if self._use_native_gemini:
+                if self._gemini_native:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
-
                 return self._chat_compat(messages, temperature, max_tokens)
-
-            except _GeminiCompatForbidden as exc:
-                # Model not available on OpenAI-compat layer — switch to native.
-                log.warning(
-                    "Gemini compat endpoint returned 403 for model '%s'. "
-                    "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
-                    self.model,
-                )
-                self._use_native_gemini = True
-                # Retry immediately with native — don't count as a rate-limit wait
-                try:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
-                except httpx.HTTPStatusError as native_exc:
-                    raise RuntimeError(
-                        f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
-                        f"Native: {native_exc.response.status_code} — "
-                        f"{native_exc.response.text[:200]}"
-                    ) from native_exc
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
@@ -273,11 +292,18 @@ class LLMClient:
         self._client.close()
 
 
-class _GeminiCompatForbidden(Exception):
-    """Sentinel: Gemini OpenAI-compat returned 403. Switch to native API."""
-    def __init__(self, response: httpx.Response) -> None:
-        self.response = response
-        super().__init__(f"Gemini compat 403: {response.text[:200]}")
+def _log_openai_error_body(resp: httpx.Response) -> None:
+    """Log response body for failed chat/completions (helps debug 400 validation errors)."""
+    try:
+        body = resp.text
+    except Exception as exc:  # pragma: no cover
+        body = f"<could not read body: {exc}>"
+    log.error(
+        "chat/completions HTTP %s — %s — body: %s",
+        resp.status_code,
+        resp.reason_phrase,
+        body[:8000] if body else "<empty>",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +318,7 @@ def get_client() -> LLMClient:
     global _instance
     if _instance is None:
         base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
+        mode = "Gemini native generateContent" if base_url.rstrip("/") == _GEMINI_NATIVE_BASE.rstrip("/") else base_url
+        log.info("LLM provider: %s  model: %s", mode, model)
         _instance = LLMClient(base_url, model, api_key)
     return _instance

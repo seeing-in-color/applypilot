@@ -171,6 +171,20 @@ DEFAULTS = {
 }
 
 
+def get_apply_pilot_llm_delay() -> float:
+    """Seconds to wait between consecutive LLM calls during job scoring.
+
+    Helps avoid provider rate limits without excessive slowdown. Environment:
+    ``APPLY_PILOT_LLM_DELAY`` (default ``4.5``). Set to ``0`` to disable pauses.
+    """
+    load_env()
+    raw = os.environ.get("APPLY_PILOT_LLM_DELAY", "4.5")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 4.5
+
+
 def load_env():
     """Load environment variables from ~/.applypilot/.env if it exists."""
     from dotenv import load_dotenv

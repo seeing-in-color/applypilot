@@ -36,6 +36,10 @@ blocked_sso:
 # Used by detail enrichment to resolve relative URLs scraped from sites.
 # Sites not listed here (or with null) cannot have relative URLs resolved.
 base_urls:
+  # JobSpy uses lowercase site names (e.g. linkedin, indeed) for relative URL resolution
+  "linkedin": "https://www.linkedin.com"
+  "indeed": "https://www.indeed.com"
+  "zip_recruiter": "https://www.ziprecruiter.com"
   "Job Bank Canada": "https://www.jobbank.gc.ca"
   "CareerJet Canada": "https://www.careerjet.ca"
   "BuiltIn Remote": "https://builtin.com"

@@ -54,13 +54,38 @@ def _load_base_urls() -> dict[str, str | None]:
     return load_base_urls()
 
 
+def _is_placeholder_url(value: str) -> bool:
+    """True if value is a missing/invalid sentinel (pandas/JobSpy None → str 'None', NaN, etc.)."""
+    t = value.strip().lower()
+    return t in ("", "none", "nan", "null", "undefined")
+
+
 def resolve_url(raw_url: str, site: str) -> str | None:
     """Resolve a stored URL to an absolute URL."""
     if not raw_url:
         return None
 
+    raw_url = raw_url.strip()
+    if _is_placeholder_url(raw_url):
+        return None
+    # Protocol-relative (//cdn.example/...) — common on LinkedIn
+    if raw_url.startswith("//"):
+        return "https:" + raw_url
+
     if raw_url.startswith("http://") or raw_url.startswith("https://"):
         return raw_url
+
+    # Path-only URLs from major boards (JobSpy site is e.g. "linkedin", "indeed")
+    sl = (site or "").lower()
+    if raw_url.startswith("/"):
+        if "linkedin" in sl:
+            return urljoin("https://www.linkedin.com", raw_url)
+        if "indeed" in sl:
+            return urljoin("https://www.indeed.com", raw_url)
+        if "glassdoor" in sl:
+            return urljoin("https://www.glassdoor.com", raw_url)
+        if "zip" in sl:
+            return urljoin("https://www.ziprecruiter.com", raw_url)
 
     if site == "WelcomeToTheJungle":
         return None
@@ -277,7 +302,27 @@ def extract_from_json_ld(intel: dict) -> dict | None:
 
 # -- Tier 2: Deterministic pattern matching ----------------------------------
 
+def _normalize_apply_href(href: str | None, page_url: str) -> str | None:
+    """Turn relative / protocol-relative apply links into absolute https URLs."""
+    if not href or href == "#":
+        return None
+    h = href.strip()
+    if h.lower().startswith("javascript:"):
+        return None
+    if h.startswith("//"):
+        return "https:" + h
+    if h.startswith(("http://", "https://")):
+        return h
+    if h.startswith("/") and page_url.startswith(("http://", "https://")):
+        return urljoin(page_url, h)
+    return h
+
+
 APPLY_SELECTORS = [
+    # LinkedIn (Easy Apply / external apply anchors)
+    'a.jobs-apply-button',
+    'a[data-view-name="job-apply-button"]',
+    '.jobs-unified-top-card__apply-button a',
     'a[href*="apply"]',
     'a[data-testid*="apply"]',
     'a[class*="apply"]',
@@ -322,19 +367,23 @@ DESCRIPTION_SELECTORS = [
 
 def extract_apply_url_deterministic(page) -> str | None:
     """Try known CSS patterns for apply buttons/links."""
+    page_url = page.url or ""
+
     for sel in APPLY_SELECTORS:
         try:
             el = page.query_selector(sel)
             if el:
                 href = el.get_attribute("href")
-                if href and href != "#":
-                    return href
+                norm = _normalize_apply_href(href, page_url)
+                if norm:
+                    return norm
                 tag = el.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "button":
                     parent_href = el.evaluate("el => el.parentElement?.querySelector('a')?.href || null")
-                    if parent_href:
-                        return parent_href
-                    return page.url
+                    norm = _normalize_apply_href(parent_href, page_url)
+                    if norm:
+                        return norm
+                    return page_url if page_url.startswith("http") else None
         except Exception:
             continue
 
@@ -344,8 +393,9 @@ def extract_apply_url_deterministic(page) -> str | None:
             text = link.inner_text().strip().lower()
             if "apply" in text and len(text) < 50:
                 href = link.get_attribute("href")
-                if href and href != "#" and "javascript:" not in href:
-                    return href
+                norm = _normalize_apply_href(href, page_url)
+                if norm:
+                    return norm
     except Exception:
         pass
 
@@ -572,6 +622,10 @@ def scrape_detail_page(page, url: str) -> dict:
                 result["application_url"] = apply
         result["status"] = "ok" if result.get("application_url") else "partial"
         result["elapsed"] = time.time() - t0
+        if result.get("application_url") and page.url:
+            n = _normalize_apply_href(str(result["application_url"]), page.url)
+            if n:
+                result["application_url"] = n
         return result
 
     # Tier 2: Deterministic CSS
@@ -584,6 +638,10 @@ def scrape_detail_page(page, url: str) -> dict:
         result["tier_used"] = 2
         result["status"] = "ok" if apply else "partial"
         result["elapsed"] = time.time() - t0
+        if result.get("application_url") and page.url:
+            n = _normalize_apply_href(str(result["application_url"]), page.url)
+            if n:
+                result["application_url"] = n
         return result
 
     tier2_apply = apply
@@ -603,6 +661,10 @@ def scrape_detail_page(page, url: str) -> dict:
         result["error"] = "no data extracted"
 
     result["elapsed"] = time.time() - t0
+    if result.get("application_url") and page.url:
+        n = _normalize_apply_href(str(result["application_url"]), page.url)
+        if n:
+            result["application_url"] = n
     return result
 
 

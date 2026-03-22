@@ -117,7 +117,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `OPENAI_API_KEY` (preferred when set; default model `gpt-4o-mini`) or `GEMINI_API_KEY` if OpenAI is unset, `LLM_MODEL`, `APPLY_PILOT_LLM_DELAY` (seconds between scoring calls, default 4.5), `CAPSOLVER_API_KEY` (optional).
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -136,6 +136,8 @@ Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD s
 
 ### Score
 AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
+
+Scoring runs in **chunks** (default 25 jobs) with a **5s pause** between chunks for stable Gemini usage; each job is committed to the DB as it finishes. Tune with `applypilot run score --chunk-size N --chunk-delay SECONDS`. Per-request spacing also uses `APPLY_PILOT_LLM_DELAY` (default 4.5s).
 
 ### Tailor
 Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.

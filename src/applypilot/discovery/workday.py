@@ -22,6 +22,12 @@ import yaml
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
+from applypilot.discovery.location_filter import (
+    evaluate_discovery_location,
+    legacy_location_ok,
+    use_legacy_location_lists,
+    workday_listing_needs_detail_fetch,
+)
 
 log = logging.getLogger(__name__)
 
@@ -41,34 +47,19 @@ def load_employers() -> dict:
 # -- Location filtering from search config -----------------------------------
 
 def _load_location_filter(search_cfg: dict | None = None):
-    """Load location accept/reject lists from search config."""
+    """Load location accept/reject lists from search config (legacy YAML mode only)."""
     if search_cfg is None:
         search_cfg = config.load_search_config()
 
     accept = search_cfg.get("location_accept", [])
     reject = search_cfg.get("location_reject_non_remote", [])
+    nested = search_cfg.get("location") or {}
+    if isinstance(nested, dict):
+        if not accept:
+            accept = nested.get("accept_patterns", [])
+        if not reject:
+            reject = nested.get("reject_patterns", [])
     return accept, reject
-
-
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
-    """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-
-    loc = location.lower()
-
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    return False
 
 
 # -- HTML stripper -----------------------------------------------------------
@@ -194,6 +185,7 @@ def search_employer(
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    legacy_location: bool = False,
 ) -> list[dict]:
     """Search an employer, paginate through all results, optionally filter by location."""
     log.info("%s: searching \"%s\"...", employer["name"], search_text)
@@ -221,9 +213,16 @@ def search_employer(
 
         for j in postings:
             loc = j.get("locationsText", "")
-            if location_filter and accept_locs is not None and reject_locs is not None:
-                if not _location_ok(loc, accept_locs, reject_locs):
-                    continue
+            if location_filter:
+                if legacy_location:
+                    al = accept_locs if accept_locs is not None else []
+                    rl = reject_locs if reject_locs is not None else []
+                    if not legacy_location_ok(loc, al, rl):
+                        continue
+                else:
+                    res = evaluate_discovery_location(loc)
+                    if not res.keep and not workday_listing_needs_detail_fetch(loc):
+                        continue
 
             all_jobs.append({
                 "title": j.get("title", ""),
@@ -271,6 +270,33 @@ def _fetch_one_detail(employer: dict, job: dict) -> dict:
         job["detail_error"] = str(e)
 
     return job
+
+
+def filter_workday_jobs_by_location(
+    jobs: list[dict],
+    *,
+    legacy_location: bool,
+    accept_locs: list[str],
+    reject_locs: list[str],
+) -> list[dict]:
+    """Final discovery gate using listing text + Workday ``remoteType`` (after detail fetch)."""
+    if legacy_location:
+        out = []
+        for job in jobs:
+            loc = job.get("location")
+            if legacy_location_ok(loc, accept_locs, reject_locs):
+                out.append(job)
+        return out
+
+    kept: list[dict] = []
+    for job in jobs:
+        r = evaluate_discovery_location(
+            job.get("location"),
+            workday_remote_type=job.get("remote_type"),
+        )
+        if r.keep:
+            kept.append(job)
+    return kept
 
 
 def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
@@ -347,6 +373,7 @@ def _process_one(
     location_filter: bool,
     accept_locs: list[str],
     reject_locs: list[str],
+    legacy_location: bool,
 ) -> dict:
     """Search one employer, fetch details, store results."""
     emp = employers[employer_key]
@@ -357,6 +384,7 @@ def _process_one(
             location_filter=location_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            legacy_location=legacy_location,
         )
     except Exception as e:
         log.error("%s: ERROR searching '%s': %s", emp["name"], search_text, e)
@@ -371,6 +399,22 @@ def _process_one(
         jobs = fetch_details(emp, jobs)
     except Exception as e:
         log.error("%s: ERROR fetching details for '%s': %s", emp["name"], search_text, e)
+
+    if location_filter:
+        before_loc = len(jobs)
+        jobs = filter_workday_jobs_by_location(
+            jobs,
+            legacy_location=legacy_location,
+            accept_locs=accept_locs,
+            reject_locs=reject_locs,
+        )
+        dropped = before_loc - len(jobs)
+        if dropped:
+            log.info(
+                "%s: dropped %d jobs after location gate (post-detail)",
+                emp["name"],
+                dropped,
+            )
 
     conn = get_connection()
     new, existing = store_results(conn, jobs, employers)
@@ -390,6 +434,7 @@ def scrape_employers(
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    legacy_location: bool = False,
     workers: int = 1,
 ) -> dict:
     """Run full scrape: search -> filter -> detail -> store.
@@ -423,7 +468,7 @@ def scrape_employers(
             futures = {
                 pool.submit(
                     _process_one, key, employers, search_text,
-                    location_filter, accept_locs, reject_locs,
+                    location_filter, accept_locs, reject_locs, legacy_location,
                 ): key
                 for key in valid_keys
             }
@@ -446,7 +491,7 @@ def scrape_employers(
         for key in valid_keys:
             result = _process_one(
                 key, employers, search_text,
-                location_filter, accept_locs, reject_locs,
+                location_filter, accept_locs, reject_locs, legacy_location,
             )
             completed += 1
             total_new += result["new"]
@@ -493,6 +538,11 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     search_cfg = config.load_search_config()
     queries_cfg = search_cfg.get("queries", [])
     accept_locs, reject_locs = _load_location_filter(search_cfg)
+    legacy_location = use_legacy_location_lists(search_cfg)
+    if legacy_location:
+        log.info("Workday discovery: using legacy YAML location_accept / location_reject patterns")
+    else:
+        log.info("Workday discovery: strict location gate (Remote or Austin, TX only)")
 
     # Default to tier 1-2 queries for workday scraping
     max_tier = search_cfg.get("workday_max_tier", 2)
@@ -526,6 +576,7 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
             location_filter=location_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            legacy_location=legacy_location,
             workers=workers,
         )
         grand_new += result["new"]

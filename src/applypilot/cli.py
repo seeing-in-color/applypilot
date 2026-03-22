@@ -97,6 +97,21 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    chunk_size: int = typer.Option(
+        25,
+        "--chunk-size",
+        help="Score stage: jobs per batch before a pause (Gemini-friendly; default 25).",
+    ),
+    chunk_delay: float = typer.Option(
+        5.0,
+        "--chunk-delay",
+        help="Score stage: seconds to pause after each batch except the last (default 5).",
+    ),
+    score_verbose: bool = typer.Option(
+        False,
+        "--score-verbose",
+        help="Score stage: full logs (prompt sizes, job essentials, chunk summaries). Default: minimal.",
+    ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
@@ -136,6 +151,9 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        chunk_size=chunk_size,
+        chunk_delay=chunk_delay,
+        score_verbose=score_verbose,
     )
 
     if result.get("errors"):
@@ -383,17 +401,17 @@ def doctor() -> None:
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
+    if has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
+    elif has_gemini:
+        model = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
     elif has_local:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+                        "Set OPENAI_API_KEY or GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI
