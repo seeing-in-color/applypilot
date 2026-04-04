@@ -139,6 +139,16 @@ AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 
 
 Scoring runs in **chunks** (default 25 jobs) with a **5s pause** between chunks for stable Gemini usage; each job is committed to the DB as it finishes. Tune with `applypilot run score --chunk-size N --chunk-delay SECONDS`. Per-request spacing also uses `APPLY_PILOT_LLM_DELAY` (default 4.5s).
 
+**Score one job** (already in the DB with a full description): use the special stage `score-one` with a URL substring or title substring:
+
+```bash
+applypilot run score-one --url-fragment JREQ196916
+applypilot run score-one --title "Solutions Architect - Reuters Imagen"
+applypilot score-one -u JREQ196916              # equivalent top-level command
+```
+
+Add `--write-db` to save the score to SQLite; use `--score-one-verbose` with `run score-one` for full prompt diagnostics.
+
 ### Tailor
 Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
 
@@ -166,6 +176,8 @@ applypilot apply --gen --url URL       # generate prompt file for manual debuggi
 applypilot init                         # First-time setup wizard
 applypilot doctor                       # Verify setup, diagnose missing requirements
 applypilot run [stages...]              # Run pipeline stages (or 'all')
+applypilot run score-one -u SUBSTRING   # Score one job by URL fragment (or --title "...")
+applypilot score-one -u SUBSTRING       # Same (shorthand)
 applypilot run --workers 4              # Parallel discovery/enrichment
 applypilot run --stream                 # Concurrent stages (streaming mode)
 applypilot run --min-score 8            # Override score threshold

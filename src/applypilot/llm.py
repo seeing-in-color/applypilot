@@ -4,6 +4,7 @@ Unified LLM client for ApplyPilot.
 Auto-detects provider from environment:
   OPENAI_API_KEY  -> OpenAI Chat Completions (default: gpt-4o-mini) — used when set
   GEMINI_API_KEY  -> Google Gemini native generateContent (default: gemini-2.5-flash) — if no OpenAI key
+  ANTHROPIC_API_KEY -> Anthropic Messages API (default: claude-3-5-haiku-latest)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
 LLM_MODEL env var overrides the model name for any provider.
@@ -23,6 +24,7 @@ _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 # Official OpenAI API — use Chat Completions fields this API expects (not Gemini).
 _OPENAI_API_HOST = "api.openai.com"
+_ANTHROPIC_BASE = "https://api.anthropic.com/v1"
 
 
 def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
@@ -61,8 +63,29 @@ def _detect_provider() -> tuple[str, str, str]:
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
+    provider_override = (os.environ.get("LLM_PROVIDER", "") or "").strip().lower()
+
+    if provider_override:
+        if provider_override == "openai":
+            if not openai_key:
+                raise RuntimeError("LLM_PROVIDER=openai but OPENAI_API_KEY is missing.")
+            return ("https://api.openai.com/v1", model_override or "gpt-4o-mini", openai_key)
+        if provider_override == "gemini":
+            if not gemini_key:
+                raise RuntimeError("LLM_PROVIDER=gemini but GEMINI_API_KEY is missing.")
+            return (_GEMINI_NATIVE_BASE, model_override or "gemini-2.5-flash", gemini_key)
+        if provider_override == "anthropic":
+            if not anthropic_key:
+                raise RuntimeError("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is missing.")
+            return (_ANTHROPIC_BASE, model_override or "claude-3-5-haiku-latest", anthropic_key)
+        if provider_override == "local":
+            if not local_url:
+                raise RuntimeError("LLM_PROVIDER=local but LLM_URL is missing.")
+            return (local_url.rstrip("/"), model_override or "local-model", os.environ.get("LLM_API_KEY", ""))
+        raise RuntimeError("Unknown LLM_PROVIDER. Use one of: openai, gemini, anthropic, local.")
 
     # Prefer OpenAI when OPENAI_API_KEY is set (scoring + all LLM stages use this client).
     if openai_key and not local_url:
@@ -78,6 +101,13 @@ def _detect_provider() -> tuple[str, str, str]:
             _GEMINI_NATIVE_BASE,
             model_override or "gemini-2.5-flash",
             gemini_key,
+        )
+
+    if anthropic_key and not local_url:
+        return (
+            _ANTHROPIC_BASE,
+            model_override or "claude-3-5-haiku-latest",
+            anthropic_key,
         )
 
     if local_url:
@@ -115,6 +145,7 @@ class LLMClient:
         self._client = httpx.Client(timeout=_TIMEOUT)
         # Gemini via GEMINI_API_KEY uses _GEMINI_NATIVE_BASE + generateContent only.
         self._gemini_native = base_url.rstrip("/") == _GEMINI_NATIVE_BASE.rstrip("/")
+        self._anthropic = base_url.rstrip("/") == _ANTHROPIC_BASE.rstrip("/")
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -208,6 +239,53 @@ class LLMClient:
 
         return self._handle_compat_response(resp)
 
+    # -- Anthropic Messages API ---------------------------------------------
+
+    def _chat_anthropic(
+        self,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        """Call Anthropic Messages API with OpenAI-style input conversion."""
+        system_parts: list[str] = []
+        out_msgs: list[dict] = []
+        for msg in messages:
+            role = (msg.get("role") or "user").strip()
+            content = msg.get("content")
+            text = content if isinstance(content, str) else str(content or "")
+            if role in ("system", "developer"):
+                system_parts.append(text)
+                continue
+            if role not in ("user", "assistant"):
+                role = "user"
+            out_msgs.append({"role": role, "content": text})
+
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": out_msgs or [{"role": "user", "content": ""}],
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts).strip()
+
+        resp = self._client.post(
+            f"{_ANTHROPIC_BASE}/messages",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        if resp.status_code >= 400:
+            resp.raise_for_status()
+        data = resp.json()
+        blocks = data.get("content") or []
+        texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(t for t in texts if t).strip()
+
     @staticmethod
     def _handle_compat_response(resp: httpx.Response) -> str:
         if resp.status_code >= 400:
@@ -243,6 +321,8 @@ class LLMClient:
             try:
                 if self._gemini_native:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
+                if self._anthropic:
+                    return self._chat_anthropic(messages, temperature, max_tokens)
                 return self._chat_compat(messages, temperature, max_tokens)
 
             except httpx.HTTPStatusError as exc:

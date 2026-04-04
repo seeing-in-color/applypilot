@@ -25,6 +25,7 @@ from playwright.sync_api import sync_playwright
 from applypilot import config
 from applypilot.config import DB_PATH
 from applypilot.database import get_connection, init_db, ensure_columns
+from applypilot.discovery.travel_filter import is_excessive_travel_requirement
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -679,7 +680,9 @@ def scrape_site_batch(
 
     If conn is None, creates its own DB connection.
     """
-    stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    stats: dict = {
+        "processed": 0, "ok": 0, "partial": 0, "error": 0, "filtered_travel": 0, "tiers": {1: 0, 2: 0, 3: 0}
+    }
 
     if max_jobs:
         jobs = jobs[:max_jobs]
@@ -724,6 +727,17 @@ def scrape_site_batch(
                          status, tier_str, f"{desc_len:,}", apply_str, elapsed, err_str)
 
                 if status in ("ok", "partial"):
+                    desc_text = result.get("full_description") or ""
+                    too_much_travel, travel_pct = is_excessive_travel_requirement(desc_text)
+                    if too_much_travel:
+                        stats["filtered_travel"] += 1
+                        conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
+                        conn.commit()
+                        log.info(
+                            "  filtered | travel=%s%% > 25%% | removed from pipeline",
+                            travel_pct,
+                        )
+                        continue
                     stats[status] += 1
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
@@ -772,7 +786,7 @@ def _run_detail_scraper(
 
     if not rows:
         log.info("No pending jobs to scrape.")
-        return {"processed": 0, "ok": 0, "partial": 0, "error": 0}
+        return {"processed": 0, "ok": 0, "partial": 0, "error": 0, "filtered_travel": 0}
 
     site_jobs: dict[str, list[tuple]] = {}
     for row in rows:
@@ -792,10 +806,12 @@ def _run_detail_scraper(
     order = [s for s in known_order if s in site_jobs]
     order += [s for s in sorted(site_jobs.keys()) if s not in order]
 
-    total_stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    total_stats: dict = {
+        "processed": 0, "ok": 0, "partial": 0, "error": 0, "filtered_travel": 0, "tiers": {1: 0, 2: 0, 3: 0}
+    }
 
     def _merge_stats(stats: dict) -> None:
-        for k in ("processed", "ok", "partial", "error"):
+        for k in ("processed", "ok", "partial", "error", "filtered_travel"):
             total_stats[k] += stats[k]
         for t, count in stats["tiers"].items():
             total_stats["tiers"][t] = total_stats["tiers"].get(t, 0) + count
@@ -808,8 +824,8 @@ def _run_detail_scraper(
             delay = SITE_DELAYS.get(site, 2.0)
             log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
             stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site)
-            log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
-                     site, stats["ok"], stats["partial"], stats["error"],
+            log.info("%s summary: %d ok, %d partial, %d error, %d filtered(travel) | T1=%d T2=%d T3=%d",
+                     site, stats["ok"], stats["partial"], stats["error"], stats.get("filtered_travel", 0),
                      stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
             return stats
 
@@ -827,12 +843,13 @@ def _run_detail_scraper(
             stats = scrape_site_batch(conn, site, jobs, delay=delay, max_jobs=max_per_site)
             _merge_stats(stats)
 
-            log.info("Site summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
-                     stats["ok"], stats["partial"], stats["error"],
+            log.info("Site summary: %d ok, %d partial, %d error, %d filtered(travel) | T1=%d T2=%d T3=%d",
+                     stats["ok"], stats["partial"], stats["error"], stats.get("filtered_travel", 0),
                      stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
 
-    log.info("TOTAL: %d processed | %d ok | %d partial | %d error",
-             total_stats["processed"], total_stats["ok"], total_stats["partial"], total_stats["error"])
+    log.info("TOTAL: %d processed | %d ok | %d partial | %d error | %d filtered(travel)",
+             total_stats["processed"], total_stats["ok"], total_stats["partial"], total_stats["error"],
+             total_stats.get("filtered_travel", 0))
     log.info("Tier distribution: T1=%d T2=%d T3=%d",
              total_stats["tiers"].get(1, 0), total_stats["tiers"].get(2, 0), total_stats["tiers"].get(3, 0))
 

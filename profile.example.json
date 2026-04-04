@@ -8,7 +8,8 @@
     "address": "123 Main St",
     "city": "Your City",
     "province_state": "Your State/Province",
-    "country": "Your Country",
+    "country": "United States",
+    "phone_country_code": "United States (+1)",
     "postal_code": "A1B 2C3",
     "linkedin_url": "https://www.linkedin.com/in/yourprofile",
     "github_url": "https://github.com/yourusername",
@@ -32,6 +33,12 @@
     "salary_range_max": "100000",
     "currency_conversion_note": ""
   },
+  "education": {
+    "school": "University of Florida",
+    "degree": "Bachelor's Degree",
+    "discipline": "Mechanical Engineering",
+    "discipline_fallback": "Engineering"
+  },
   "experience": {
     "years_of_experience_total": "3",
     "education_level": "Bachelor's Degree",
@@ -53,8 +60,11 @@
     "real_metrics": ["50% improvement", "10x faster"]
   },
   "eeo_voluntary": {
-    "gender": "Decline to self-identify",
-    "race_ethnicity": "Decline to self-identify",
+    "gender_identity": "Male",
+    "gender": "Male",
+    "race_ethnicity": "Hispanic or Latino",
+    "pronouns": "he/him",
+    "sexual_orientation": "Straight",
     "veteran_status": "I am not a protected veteran",
     "disability_status": "I do not wish to answer"
   }

@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from applypilot import config
+from applypilot.apply.field_answers import format_rules_for_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,17 @@ def _build_profile_summary(profile: dict) -> str:
     avail = p.get("availability", {})
     eeo = p.get("eeo_voluntary", {})
 
+    full_nm = (personal.get("full_name") or "").strip()
+    parts = full_nm.split()
+    first_for_forms = parts[0] if parts else ""
+    last_for_forms = parts[-1] if len(parts) > 1 else ""
+    pref = (personal.get("preferred_name") or "").strip() or first_for_forms
+
     lines = [
         f"Name: {personal['full_name']}",
+        f"First name (use on applications): {first_for_forms}",
+        f"Last name (use on applications): {last_for_forms}",
+        f"Preferred first name (if asked): {pref}",
         f"Email: {personal['email']}",
         f"Phone: {personal['phone']}",
     ]
@@ -438,6 +448,8 @@ def build_prompt(job: dict, tailored_resume: str,
     profile = config.load_profile()
     search_config = config.load_search_config()
     personal = profile["personal"]
+    linkedin_email = str(personal.get("linkedin_email") or "").strip()
+    linkedin_password = str(personal.get("linkedin_password") or "").strip()
 
     # --- Resolve resume PDF path ---
     resume_path = job.get("tailored_resume_path")
@@ -513,10 +525,19 @@ def build_prompt(job: dict, tailored_resume: str,
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
+    job_url_raw = job.get("application_url") or job["url"] or ""
+    linkedin_step4_note = ""
+    if "linkedin.com" in job_url_raw.lower():
+        linkedin_step4_note = (
+            "\n   LINKEDIN / EXTERNAL: First Apply often opens the employer or ATS (new tab or redirect). "
+            "On that destination, click Apply / Apply now / Start application again if shown — before login or "
+            "long forms — non–Easy Apply usually needs two Apply steps (LinkedIn, then employer site).\n"
+        )
+
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
 == JOB ==
-URL: {job.get('application_url') or job['url']}
+URL: {job_url_raw}
 Title: {job['title']}
 Company: {job.get('site', 'Unknown')}
 Fit Score: {job.get('fit_score', 'N/A')}/10
@@ -561,17 +582,22 @@ If something unexpected happens and these instructions don't cover it, figure it
 1. browser_navigate to the job URL.
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
 3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
-4. Find and click the Apply button. If email-only (page says "email resume to X"):
+4. Find and click the Apply button.{linkedin_step4_note}   If email-only (page says "email resume to X"):
    - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
    - Output RESULT:APPLIED. Done.
    After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
 5. Login wall?
    5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
    5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
+   5c. Regular login form (NOT SSO)?
+       - If it's LinkedIn: sign in with {linkedin_email or personal['email']} / {(linkedin_password or personal.get('password', ''))}
+       - Otherwise (employer's own site): sign in with {personal['email']} / {personal.get('password', '')}
    5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
    5e. Sign in failed? Try sign up with same email and password.
-   5f. Need email verification? Use search_emails + read_email to get the code.
+   5f. Need email verification code?
+       - Try ONCE via search_emails + read_email.
+       - If code cannot be fetched immediately, STOP and output RESULT:FAILED:email_verification_required.
+       - Do NOT keep looping on verification screens.
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
@@ -579,6 +605,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
+   - If a field **already** matches the profile/resume (same name, email, etc.), **leave it** — do not clear and re-type (avoids loops and broken inputs).
 9. Answer screening questions using the rules above.
 10. {submit_instruction}
 11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
@@ -622,3 +649,131 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 Stop immediately. Output your RESULT code. Do not loop."""
 
     return prompt
+
+
+def build_compact_apply_prompt(
+    job: dict,
+    tailored_resume: str,
+    *,
+    dry_run: bool = False,
+    resume_excerpt_chars: int = 2_500,
+) -> str:
+    """Shorter prompt for OpenAI tool-calling apply (fewer tokens than full Claude prompt).
+
+    Uses the same resume PDF path resolution as ``build_prompt`` but omits long
+    CAPTCHA / email-tool sections. The browser is driven via direct Playwright tools.
+    """
+    profile = config.load_profile()
+    search_config = config.load_search_config()
+    personal = profile["personal"]
+    linkedin_email = str(personal.get("linkedin_email") or "").strip()
+    linkedin_password = str(personal.get("linkedin_password") or "").strip()
+
+    resume_path = job.get("tailored_resume_path")
+    if not resume_path:
+        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
+    src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
+    if not src_pdf.exists():
+        raise ValueError(f"Resume PDF not found: {src_pdf}")
+
+    full_name = personal["full_name"]
+    name_slug = full_name.replace(" ", "_")
+    dest_dir = config.APPLY_WORKER_DIR / "current"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
+    shutil.copy(str(src_pdf), str(upload_pdf))
+    pdf_path = str(upload_pdf)
+
+    profile_summary = _build_profile_summary(profile)
+    location_check = _build_location_check(profile, search_config)
+    excerpt = (tailored_resume or "")[:resume_excerpt_chars]
+    if len(tailored_resume or "") > resume_excerpt_chars:
+        excerpt += "\n…[resume truncated]"
+
+    if dry_run:
+        submit_line = (
+            "Do NOT click final Submit. When the form is filled and resume uploaded, "
+            "output RESULT:APPLIED with note dry-run."
+        )
+    else:
+        submit_line = (
+            "After verifying fields, click Submit once, then output RESULT:APPLIED or failure."
+        )
+
+    li_login = (
+        f"Employer login email/password: {personal['email']} / {personal.get('password', '')}\n"
+        f"LinkedIn (if different): {(linkedin_email or personal['email'])} / "
+        f"{(linkedin_password or personal.get('password', ''))}"
+    )
+
+    job_url = job.get("application_url") or job["url"]
+    field_rules_block = format_rules_for_prompt()
+    linkedin_apply_note = ""
+    if "linkedin.com" in ((job_url or "").lower()):
+        linkedin_apply_note = """
+== LINKEDIN → EMPLOYER SITE (read first) ==
+The job link is on LinkedIn. Automation may have already clicked Apply once. If you still see LinkedIn,
+click Apply / "Apply on company website" / Easy Apply to reach the employer or ATS.
+
+After leaving LinkedIn (new tab or URL change to Greenhouse, Lever, Workday, icims, company careers, etc.):
+look for ANOTHER primary "Apply", "Apply now", or "Start application" on THAT site and click it before
+signing in or filling fields. Non–Easy Apply listings usually need: (1) Apply on LinkedIn → (2) Apply on
+the employer page → (3) then login/application form.
+
+Use browser_tabs list/select if Apply opened a separate tab. Dismiss cookie banners if they block clicks.
+"""
+
+    return f"""You control the browser via tools only. Be concise. Minimize snapshots.
+
+== JOB ==
+URL: {job_url}
+Title: {job["title"]}
+Site: {job.get("site", "")}
+Score: {job.get("fit_score", "N/A")}/10
+{linkedin_apply_note}
+== FILES ==
+Resume PDF (upload): {pdf_path}
+
+== PROFILE ==
+{profile_summary}
+
+== LOCATION ==
+{location_check}
+
+== RESUME EXCERPT ==
+{excerpt}
+
+== RULES ==
+- {li_login}
+- No SSO (Google/Microsoft OAuth). If forced to SSO page: RESULT:FAILED:sso_required
+- Email verification you cannot complete: RESULT:FAILED:email_verification_required
+- {submit_line}
+
+== FORM FILLING (use LLM + tools; multi-page OK) ==
+1) On each application step, call browser_form_fields to list inputs with selectors, labels, **current_value** (already in the field), frame_index, frame_url, and suggested_answer (from saved rules). Greenhouse/Lever forms are often inside an iframe — you MUST pass the same frame_index on browser_fill / browser_select / browser_upload_file for those rows.
+2) **Do not re-fill** fields that already show the correct answer: compare each row's **current_value** to PROFILE / suggested_answer / resume. Only use browser_fill or browser_select when empty, still a placeholder, or **wrong** vs the true answer. Re-typing correct values causes loops and broken React/ATS widgets. Tools return ``skipped: already matches`` / ``skipped: already selected`` when the DOM already matches — treat that as success and move on. **School / university typeaheads:** if **current_value** already contains the PROFILE school name (even if the label is longer), **skip** and fill the next empty field (e.g. pronouns).
+3) Fill every remaining visible field from PROFILE + RESUME EXCEPT where suggested_answer is set — use that value first. Use PROFILE first/last/preferred first name lines for split name fields.
+4) For any other field: infer the best honest answer from PROFILE and resume text. If the same question might repeat later, call field_answer_save with a regex pattern and the answer you used (e.g. pattern "previously worked at", answer "No").
+5) Single-page: fill all fields, upload resume if needed, then Submit.
+6) Multi-page: fill all fields on this page, then click Next / Continue / Save and continue (not Submit until the final step). Repeat until review/submit.
+7) Radios/checkboxes: use browser_click with role+name when fill fails. File inputs: browser_upload_file with the resume PDF path.
+8) **Dropdowns / ``<select>`` (Jobvite, Data Consent):** Do not leave the placeholder like "Select your location…". Call browser_form_fields — if tag is ``select``, use **browser_select** with ``index: 1`` for the second option (e.g. privacy policy row) when the first option is only a prompt. If options are listed in ``options_preview``, match by label. Custom ARIA dropdowns: click the combobox, then the real option (not the placeholder).
+9) Prefer deterministic truth: do not invent employers or dates; use resume + profile only.
+
+== LEARNED FIELD RULES (regex → answer; user file overrides defaults) ==
+{field_rules_block}
+
+== LOGIN / ACCOUNT FLOW ==
+1) If you hit a login wall, TRY SIGN IN FIRST with the provided credentials.
+2) If sign-in fails with account-not-found/user-not-found, try "Create account"/"Sign up" with the same credentials.
+3) After account creation, return to the apply flow and continue.
+4) Use browser_tabs action=list/select whenever login opens a popup/new tab.
+5) If verification code is required and cannot be retrieved immediately, return RESULT:FAILED:email_verification_required (do not loop).
+
+== TOOLS ==
+Use browser_navigate, browser_snapshot, browser_form_fields, browser_click, browser_select, browser_fill (optional nth), browser_upload_file, browser_tabs, browser_wait_ms, field_answer_save.
+After each snapshot or form_fields result, plan the next 1–3 tool calls. Avoid long reasoning.
+
+== END ==
+When done, output EXACTLY one line: RESULT:APPLIED | RESULT:EXPIRED | RESULT:CAPTCHA | RESULT:LOGIN_ISSUE | RESULT:FAILED:reason
+"""

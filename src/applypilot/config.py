@@ -11,6 +11,7 @@ APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
 # Core paths
 DB_PATH = APP_DIR / "applypilot.db"
 PROFILE_PATH = APP_DIR / "profile.json"
+PROJECT_PROFILE_PATH = Path.cwd() / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
@@ -92,13 +93,36 @@ def ensure_dirs():
 
 
 def load_profile() -> dict:
-    """Load user profile from ~/.applypilot/profile.json."""
+    """Load user profile.
+
+    Source-of-truth order:
+    1) project ``./profile.json`` (if present)
+    2) ``~/.applypilot/profile.json`` fallback
+    """
     import json
-    if not PROFILE_PATH.exists():
+    # Ensure ~/.applypilot/.env is loaded so env overrides apply consistently.
+    load_env()
+
+    if PROJECT_PROFILE_PATH.exists():
+        profile = json.loads(PROJECT_PROFILE_PATH.read_text(encoding="utf-8"))
+    elif PROFILE_PATH.exists():
+        profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    else:
         raise FileNotFoundError(
-            f"Profile not found at {PROFILE_PATH}. Run `applypilot init` first."
+            f"Profile not found at {PROJECT_PROFILE_PATH} or {PROFILE_PATH}. "
+            "Create ./profile.json (preferred) or run `applypilot init`."
         )
-    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+
+    # Optional credential overrides via environment variables (avoid storing secrets in repo).
+    personal = profile.setdefault("personal", {})
+    li_email = os.environ.get("APPLYPILOT_LINKEDIN_EMAIL", "").strip()
+    li_password = os.environ.get("APPLYPILOT_LINKEDIN_PASSWORD", "").strip()
+    if li_email:
+        personal["linkedin_email"] = li_email
+    if li_password:
+        personal["linkedin_password"] = li_password
+
+    return profile
 
 
 def load_search_config() -> dict:
@@ -171,6 +195,67 @@ DEFAULTS = {
 }
 
 
+def get_max_apply_attempts() -> int:
+    """Max retries for auto-apply before giving up on a job.
+
+    Environment override: ``APPLYPILOT_MAX_APPLY_ATTEMPTS`` (default ``3``).
+    """
+    load_env()
+    raw = os.environ.get("APPLYPILOT_MAX_APPLY_ATTEMPTS", str(DEFAULTS["max_apply_attempts"]))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return int(DEFAULTS["max_apply_attempts"])
+
+
+def get_apply_timeout_seconds() -> int:
+    """Per-job Claude apply timeout in seconds.
+
+    Environment override: ``APPLYPILOT_APPLY_TIMEOUT_SEC`` (default ``300``).
+    """
+    load_env()
+    raw = os.environ.get("APPLYPILOT_APPLY_TIMEOUT_SEC", str(DEFAULTS["apply_timeout"]))
+    try:
+        return max(60, int(raw))
+    except (TypeError, ValueError):
+        return int(DEFAULTS["apply_timeout"])
+
+
+def get_apply_agent_provider() -> str:
+    """Which backend runs browser apply: ``claude`` (Claude Code CLI) or ``openai`` (API + CDP).
+
+    Env: ``APPLYPILOT_APPLY_AGENT`` = ``claude`` | ``openai``.
+    Default: ``openai`` if ``OPENAI_API_KEY`` is set, else ``claude``.
+    """
+    load_env()
+    raw = os.environ.get("APPLYPILOT_APPLY_AGENT", "").strip().lower()
+    if raw in ("claude", "openai"):
+        return raw
+    return "openai" if os.environ.get("OPENAI_API_KEY") else "claude"
+
+
+def get_apply_openai_model() -> str:
+    """Model name for OpenAI apply agent (default ``gpt-4.1-mini``)."""
+    load_env()
+    return os.environ.get("APPLYPILOT_APPLY_OPENAI_MODEL", "gpt-4.1-mini").strip()
+
+
+def get_apply_deterministic_first() -> bool:
+    """Run fast deterministic checks (e.g. expired LinkedIn) before calling the LLM."""
+    load_env()
+    v = os.environ.get("APPLYPILOT_APPLY_DETERMINISTIC_FIRST", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def get_apply_openai_max_turns() -> int:
+    """Max model↔tool turns for OpenAI apply (caps cost)."""
+    load_env()
+    try:
+        return max(3, int(os.environ.get("APPLYPILOT_APPLY_OPENAI_MAX_TURNS", "20")))
+    except (TypeError, ValueError):
+        return 20
+
+
 def get_apply_pilot_llm_delay() -> float:
     """Seconds to wait between consecutive LLM calls during job scoring.
 
@@ -216,7 +301,7 @@ def get_tier() -> int:
 
     Tier 1 (Discovery):            Python + pip
     Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 3 (Full Auto-Apply):       + Chrome + (Claude Code CLI **or** ``OPENAI_API_KEY`` for OpenAI apply)
     """
     load_env()
 
@@ -225,13 +310,14 @@ def get_tier() -> int:
         return 1
 
     has_claude = shutil.which("claude") is not None
+    has_openai_apply = bool(os.environ.get("OPENAI_API_KEY"))
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_chrome and (has_claude or has_openai_apply):
         return 3
 
     return 2
@@ -255,8 +341,13 @@ def check_tier(required: int, feature: str) -> None:
     if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
         missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        has_claude = shutil.which("claude") is not None
+        has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+        if not has_claude and not has_openai:
+            missing.append(
+                "Auto-apply agent: install [bold]claude[/bold] CLI (https://claude.ai/code) "
+                "or set [bold]OPENAI_API_KEY[/bold] for OpenAI apply"
+            )
         try:
             get_chrome_path()
         except FileNotFoundError:

@@ -49,6 +49,77 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _print_score_one_results(out: dict, *, write_db: bool = False) -> None:
+    """Pretty-print output from ``run_score_one``."""
+    from applypilot.scoring.scorer import gap_hints_from_reasoning
+
+    job = out["job"]
+    score = out["score"]
+    keywords = out.get("keywords") or ""
+    reasoning = out.get("reasoning") or ""
+
+    console.print()
+    console.print(f"[bold]Job[/bold]: {job.get('title', '?')}")
+    console.print(f"[bold]URL[/bold]: {job.get('url', '?')}")
+    console.print(
+        f"[bold]Site[/bold]: {job.get('site', '?')}  |  "
+        f"[bold]Location[/bold]: {job.get('location', 'N/A')}"
+    )
+    console.print()
+    console.print(f"[bold]Fit score:[/bold] [cyan]{score}[/cyan]/10")
+    console.print()
+    console.print("[bold]Rationale[/bold]")
+    console.print(reasoning or "—")
+    console.print()
+    console.print("[bold]Matched strengths (keywords)[/bold]")
+    console.print(keywords.strip() if keywords.strip() else "—")
+    gaps = gap_hints_from_reasoning(reasoning)
+    console.print()
+    console.print("[bold]Gaps / weak areas (from rationale)[/bold]")
+    if gaps:
+        console.print(gaps)
+    else:
+        console.print(
+            "[dim]— (no contrast phrases detected automatically; read rationale above)[/dim]"
+        )
+    if write_db:
+        console.print()
+        console.print("[dim]Saved fit_score and score_reasoning to the database.[/dim]")
+
+
+def _dispatch_score_one(
+    url_fragment: Optional[str],
+    title: Optional[str],
+    write_db: bool,
+    verbose: bool,
+) -> None:
+    from applypilot.config import check_tier
+    from applypilot.scoring.scorer import run_score_one
+
+    u = (url_fragment or "").strip()
+    t = (title or "").strip()
+    if (bool(u) and bool(t)) or (not u and not t):
+        console.print(
+            "[red]Specify exactly one of --url-fragment (-u) or --title (-t).[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    check_tier(2, "AI scoring")
+
+    try:
+        out = run_score_one(
+            url_fragment=url_fragment,
+            title=title,
+            write_db=write_db,
+            verbose=verbose,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
+
+    _print_score_one_results(out, write_db=write_db)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -112,6 +183,28 @@ def run(
         "--score-verbose",
         help="Score stage: full logs (prompt sizes, job essentials, chunk summaries). Default: minimal.",
     ),
+    url_fragment: Optional[str] = typer.Option(
+        None,
+        "--url-fragment",
+        "-u",
+        help="Only with stage 'score-one': match job URL substring.",
+    ),
+    title: Optional[str] = typer.Option(
+        None,
+        "--title",
+        "-t",
+        help="Only with stage 'score-one': match title substring (case-insensitive).",
+    ),
+    write_db: bool = typer.Option(
+        False,
+        "--write-db",
+        help="Only with stage 'score-one': save fit_score and reasoning to the database.",
+    ),
+    score_one_verbose: bool = typer.Option(
+        False,
+        "--score-one-verbose",
+        help="Only with stage 'score-one': verbose scoring logs.",
+    ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
@@ -119,6 +212,22 @@ def run(
     from applypilot.pipeline import run_pipeline
 
     stage_list = stages if stages else ["all"]
+
+    if stage_list == ["score-one"]:
+        _dispatch_score_one(
+            url_fragment,
+            title,
+            write_db,
+            score_one_verbose,
+        )
+        return
+
+    if url_fragment or title or write_db:
+        console.print(
+            "[red]--url-fragment / --title / --write-db are only for "
+            "[bold]applypilot run score-one[/bold] or [bold]applypilot score-one[/bold].[/red]"
+        )
+        raise typer.Exit(code=1)
 
     # Validate stage names
     for s in stage_list:
@@ -160,12 +269,114 @@ def run(
         raise typer.Exit(code=1)
 
 
+@app.command("score-one")
+def score_one_cmd(
+    url_fragment: Optional[str] = typer.Option(
+        None,
+        "--url-fragment",
+        "-u",
+        help="Match the job whose URL contains this substring (e.g. requisition id).",
+    ),
+    title: Optional[str] = typer.Option(
+        None,
+        "--title",
+        "-t",
+        help="Match the job whose title contains this substring (case-insensitive).",
+    ),
+    write_db: bool = typer.Option(
+        False,
+        "--write-db",
+        help="Save fit_score and score_reasoning to the database.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Verbose scoring logs (prompt sizes, job essentials).",
+    ),
+) -> None:
+    """Score one job from the database (needs full_description). Uses your configured LLM.
+
+    Same as: ``applypilot run score-one --url-fragment …`` (see ``applypilot run --help``).
+    """
+    _bootstrap()
+    _dispatch_score_one(url_fragment, title, write_db, verbose)
+
+
+@app.command("inspect")
+def inspect_cmd(
+    target: str = typer.Argument(
+        "resume",
+        help="Inspectable target. Currently supported: resume",
+    ),
+) -> None:
+    """Inspect derived artifacts (e.g., parsed resume text quality)."""
+    _bootstrap()
+    if target.strip().lower() != "resume":
+        console.print("[red]Only 'resume' is currently supported.[/red]")
+        raise typer.Exit(code=1)
+
+    from applypilot.config import RESUME_PATH, RESUME_PDF_PATH
+    from applypilot.resume import ensure_clean_resume_text, is_corrupted_resume_text
+
+    try:
+        text, source_used = ensure_clean_resume_text()
+    except Exception as exc:
+        console.print("[red]Resume parse failed.[/red]")
+        console.print(
+            "[dim]Provide a cleaner source via `applypilot init` "
+            "(.txt, .docx, or OCR-friendly PDF).[/dim]"
+        )
+        console.print(f"[dim]{exc}[/dim]")
+        raise typer.Exit(code=1)
+
+    corrupted = is_corrupted_resume_text(text)
+    preview = text[:1000]
+
+    console.print()
+    console.print("[bold]Resume inspection[/bold]\n")
+    console.print(f"[bold]source file used:[/bold] {source_used}")
+    console.print(f"[bold]resume.txt path:[/bold] {RESUME_PATH}")
+    if RESUME_PDF_PATH.exists():
+        console.print(f"[bold]resume.pdf path:[/bold] {RESUME_PDF_PATH}")
+    console.print(f"[bold]corruption detected:[/bold] {'yes' if corrupted else 'no'}")
+    console.print(f"[bold]parsed chars:[/bold] {len(text)}")
+    console.print()
+    console.print("[bold]parsed text preview (~1000 chars)[/bold]")
+    console.print(preview if preview.strip() else "—")
+    console.print()
+
+
+def _resolve_apply_model(agent: str, model: Optional[str]) -> str:
+    """Default model depends on apply backend."""
+    if model:
+        return model
+    if agent == "openai":
+        from applypilot.config import get_apply_openai_model
+
+        return get_apply_openai_model()
+    return "haiku"
+
+
 @app.command()
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    agent: Optional[str] = typer.Option(
+        None,
+        "--agent",
+        "-a",
+        help="Apply backend: openai (API + Playwright CDP) or claude (Claude Code CLI + MCP). "
+        "Default: APPLYPILOT_APPLY_AGENT or openai if OPENAI_API_KEY is set.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help="Model id: e.g. gpt-4.1-mini (openai) or haiku/sonnet (claude). "
+        "Default: gpt-4.1-mini or haiku depending on --agent.",
+    ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -179,7 +390,7 @@ def apply(
     """Launch auto-apply to submit job applications."""
     _bootstrap()
 
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.config import check_tier, get_apply_agent_provider, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
@@ -234,15 +445,17 @@ def apply(
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        # --gen emits a Claude CLI invocation; model defaults to haiku for that path.
+        gen_model = _resolve_apply_model("claude", model or "haiku")
+        prompt_file = gen_prompt(target, min_score=min_score, model=gen_model)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print(f"\n[bold]Run manually (Claude Code + MCP):[/bold]")
         console.print(
-            f"  claude --model {model} -p "
+            f"  claude --model {gen_model} -p "
             f"--mcp-config {mcp_path} "
             f"--permission-mode bypassPermissions < {prompt_file}"
         )
@@ -252,10 +465,17 @@ def apply(
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
 
+    apply_agent = (agent or get_apply_agent_provider()).strip().lower()
+    if apply_agent not in ("openai", "claude"):
+        console.print("[red]--agent must be openai or claude[/red]")
+        raise typer.Exit(code=1)
+    resolved_model = _resolve_apply_model(apply_agent, model)
+
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Agent:    {apply_agent}")
+    console.print(f"  Model:    {resolved_model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -267,10 +487,11 @@ def apply(
         target_url=url,
         min_score=min_score,
         headless=headless,
-        model=model,
+        model=resolved_model,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        apply_agent=apply_agent,
     )
 
 
@@ -350,6 +571,55 @@ def dashboard() -> None:
     open_dashboard()
 
 
+@app.command("jobs-clear")
+def jobs_clear(
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Skip confirmation prompt and delete all jobs immediately.",
+    ),
+) -> None:
+    """Remove all jobs from the database (dashboard will be empty)."""
+    _bootstrap()
+    from applypilot.database import delete_all_jobs
+
+    if not yes:
+        confirmed = typer.confirm(
+            "Delete ALL jobs from the database? This also clears dashboard data.",
+            default=False,
+        )
+        if not confirmed:
+            console.print("[yellow]Cancelled. No jobs were deleted.[/yellow]")
+            raise typer.Exit(code=0)
+
+    removed = delete_all_jobs()
+    console.print(
+        f"[green]Removed {removed} job(s).[/green] "
+        "[dim]Run `applypilot dashboard` to regenerate an empty dashboard.[/dim]"
+    )
+
+
+@app.command("jobs-prune-low")
+def jobs_prune_low(
+    threshold: int = typer.Option(
+        7,
+        "--threshold",
+        "-t",
+        help="Delete scored jobs with fit_score below this value (default: 7).",
+    ),
+) -> None:
+    """Remove scored jobs below your apply threshold."""
+    _bootstrap()
+    from applypilot.database import delete_jobs_below_score
+
+    th = max(0, min(10, int(threshold)))
+    removed = delete_jobs_below_score(threshold=th)
+    console.print(
+        f"[green]Removed {removed} scored job(s) with fit_score < {th}.[/green] "
+        "[dim]Dashboard and status now reflect the filtered set.[/dim]"
+    )
+
+
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
@@ -378,7 +648,7 @@ def doctor() -> None:
     if RESUME_PATH.exists():
         results.append(("resume.txt", ok_mark, str(RESUME_PATH)))
     elif RESUME_PDF_PATH.exists():
-        results.append(("resume.txt", warn_mark, "Only PDF found — plain-text needed for AI stages"))
+        results.append(("resume.txt", warn_mark, "Only PDF found — run 'applypilot inspect resume' to parse/check"))
     else:
         results.append(("resume.txt", fail_mark, "Run 'applypilot init' to add your resume"))
 

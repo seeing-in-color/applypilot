@@ -21,8 +21,38 @@ from applypilot.discovery.location_filter import (
     legacy_location_ok,
     use_legacy_location_lists,
 )
+from applypilot.discovery.travel_filter import is_excessive_travel_requirement
 
 log = logging.getLogger(__name__)
+
+
+_KNOWN_GLASSDOOR_API_ERROR = "glassdoor: error encountered in api response"
+
+
+class _SuppressKnownJobSpyGlassdoorNoise(logging.Filter):
+    """Suppress a known noisy JobSpy Glassdoor API error log line.
+
+    JobSpy can emit an ERROR log even when the crawl can safely continue with
+    other boards. We keep our own warning/handling in this module.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            name = (record.name or "").lower()
+            msg = str(record.getMessage() or "").lower()
+        except Exception:
+            return True
+        if "glassdoor" in name and _KNOWN_GLASSDOOR_API_ERROR in msg:
+            return False
+        return True
+
+
+def _install_jobspy_log_filter() -> None:
+    for logger_name in ("JobSpy:Glassdoor", "jobspy", "jobspy.glassdoor"):
+        logging.getLogger(logger_name).addFilter(_SuppressKnownJobSpyGlassdoorNoise())
+
+
+_install_jobspy_log_filter()
 
 
 def _clean_jobspy_url(value) -> str | None:
@@ -177,6 +207,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
+    filtered_travel = 0
 
     for _, row in df.iterrows():
         url = _clean_jobspy_url(row.get("job_url"))
@@ -217,9 +248,23 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         if description and len(description) > 200:
             full_description = description
             detail_scraped_at = now
+            too_much_travel, travel_pct = is_excessive_travel_requirement(full_description)
+            if too_much_travel:
+                filtered_travel += 1
+                log.info(
+                    "Skipping '%s' (site=%s): travel requirement %s%% exceeds 25%%",
+                    (title or url)[:100],
+                    site_name,
+                    travel_pct,
+                )
+                continue
 
         # Extract apply URL if JobSpy provided it (avoid str(None) → "None" in SQLite)
         apply_url = _clean_jobspy_url(row.get("job_url_direct"))
+        # LinkedIn often omits a direct company apply URL; use the posting URL
+        # so users can still open the correct role and apply there.
+        if not apply_url and "linkedin" in (site_name or "").lower():
+            apply_url = url
 
         try:
             conn.execute(
@@ -234,6 +279,8 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             existing += 1
 
     conn.commit()
+    if filtered_travel:
+        log.info("Travel filter: skipped %d job(s) requiring >25%% travel", filtered_travel)
     return new, existing
 
 
@@ -319,9 +366,19 @@ def _run_one_search(
             if gd_df is not None and len(gd_df) > 0:
                 all_dfs.append(gd_df)
         except Exception as e:
-            log.error("[%s] (glassdoor): %s", label, e)
+            err = str(e)
+            if _KNOWN_GLASSDOOR_API_ERROR in err.lower():
+                log.warning(
+                    "[%s] (glassdoor) skipped due to transient/unsupported API response; continuing with other sites",
+                    label,
+                )
+            else:
+                log.error("[%s] (glassdoor): %s", label, e)
 
     if not all_dfs:
+        if has_glassdoor and not other_sites:
+            log.warning("[%s]: no results (Glassdoor unavailable for this query/location)", label)
+            return {"new": 0, "existing": 0, "errors": 0, "filtered": 0, "total": 0, "label": label}
         log.error("[%s]: all sites failed", label)
         return {"new": 0, "existing": 0, "errors": 1, "filtered": 0, "total": 0, "label": label}
 

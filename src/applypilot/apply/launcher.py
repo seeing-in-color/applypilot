@@ -111,7 +111,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -139,7 +139,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   {url_clauses}
                 ORDER BY fit_score DESC, url
                 LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.get_max_apply_attempts()] + params).fetchone()
 
         if not row:
             conn.rollback()
@@ -295,14 +295,24 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+            model: str = "sonnet", dry_run: bool = False,
+            apply_agent: str | None = None) -> tuple[str, int]:
+    """Run one job application (Claude Code CLI or OpenAI + CDP Playwright).
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    agent = (apply_agent or config.get_apply_agent_provider()).strip().lower()
+    if agent == "openai":
+        from applypilot.apply.openai_agent import run_job_openai
+
+        mo = model
+        if mo in ("haiku", "sonnet", "opus", "sonnet-4"):
+            mo = config.get_apply_openai_model()
+        return run_job_openai(job, port, worker_id, model=mo, dry_run=dry_run)
+
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -441,7 +451,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     text_parts.append(line)
                     lf.write(line + "\n")
 
-        proc.wait(timeout=300)
+        proc.wait(timeout=config.get_apply_timeout_seconds())
         returncode = proc.returncode
         proc = None
 
@@ -521,6 +531,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
 PERMANENT_FAILURES: set[str] = {
     "expired", "captcha", "login_issue",
+    "email_verification_required", "verification_required",
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
@@ -548,7 +559,8 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False,
+                apply_agent: str | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -601,8 +613,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
+            result, duration_ms = run_job(
+                job,
+                port=port,
+                worker_id=worker_id,
+                model=model,
+                dry_run=dry_run,
+                apply_agent=apply_agent,
+            )
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -653,7 +671,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1,
+         apply_agent: str | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -737,6 +756,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    apply_agent=apply_agent,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -760,6 +780,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            apply_agent=apply_agent,
                         ): i
                         for i in range(workers)
                     }

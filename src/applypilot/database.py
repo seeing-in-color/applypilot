@@ -422,3 +422,33 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+def delete_all_jobs(conn: sqlite3.Connection | None = None) -> int:
+    """Delete every row from ``jobs`` and return how many were removed."""
+    if conn is None:
+        conn = get_connection()
+    count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    return int(count)
+
+
+def delete_jobs_below_score(
+    threshold: int = 7,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Delete scored jobs with ``fit_score < threshold``; return removed count."""
+    if conn is None:
+        conn = get_connection()
+    th = max(0, min(10, int(threshold)))
+    count = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND fit_score < ?",
+        (th,),
+    ).fetchone()[0]
+    conn.execute(
+        "DELETE FROM jobs WHERE fit_score IS NOT NULL AND fit_score < ?",
+        (th,),
+    )
+    conn.commit()
+    return int(count)

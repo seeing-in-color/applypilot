@@ -27,6 +27,7 @@ from applypilot.config import (
     SEARCH_CONFIG_PATH,
     ensure_dirs,
 )
+from applypilot.resume import extract_resume_text_with_source
 
 console = Console()
 
@@ -36,8 +37,8 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 def _setup_resume() -> None:
-    """Prompt for resume file and copy into APP_DIR."""
-    console.print(Panel("[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.txt or .pdf)."))
+    """Prompt for resume file and persist a clean parsed ``resume.txt``."""
+    console.print(Panel("[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.txt, .docx, or .pdf)."))
 
     while True:
         path_str = Prompt.ask("Resume file path")
@@ -48,30 +49,26 @@ def _setup_resume() -> None:
             continue
 
         suffix = src.suffix.lower()
-        if suffix not in (".txt", ".pdf"):
-            console.print("[red]Unsupported format.[/red] Provide a .txt or .pdf file.")
+        if suffix not in (".txt", ".docx", ".pdf"):
+            console.print("[red]Unsupported format.[/red] Provide a .txt, .docx, or .pdf file.")
             continue
 
-        if suffix == ".txt":
-            shutil.copy2(src, RESUME_PATH)
-            console.print(f"[green]Copied to {RESUME_PATH}[/green]")
-        elif suffix == ".pdf":
-            shutil.copy2(src, RESUME_PDF_PATH)
-            console.print(f"[green]Copied to {RESUME_PDF_PATH}[/green]")
-
-            # Also ask for a plain-text version for LLM consumption
-            txt_path_str = Prompt.ask(
-                "Plain-text version of your resume (.txt)",
-                default="",
+        try:
+            parsed_text, used_source = extract_resume_text_with_source(src)
+            RESUME_PATH.write_text(parsed_text, encoding="utf-8")
+            console.print(f"[green]Parsed clean text to {RESUME_PATH}[/green]")
+            if suffix == ".pdf":
+                shutil.copy2(src, RESUME_PDF_PATH)
+                console.print(f"[green]Copied original PDF to {RESUME_PDF_PATH}[/green]")
+            if used_source != str(src):
+                console.print(f"[dim]Used alternate source for clean text: {used_source}[/dim]")
+            break
+        except Exception as exc:
+            console.print(
+                "[red]Resume parse failed.[/red] "
+                "Provide a cleaner .txt or .docx source, or a better OCR-friendly PDF."
             )
-            if txt_path_str.strip():
-                txt_src = Path(txt_path_str.strip().strip('"').strip("'")).expanduser().resolve()
-                if txt_src.exists():
-                    shutil.copy2(txt_src, RESUME_PATH)
-                    console.print(f"[green]Copied to {RESUME_PATH}[/green]")
-                else:
-                    console.print("[yellow]File not found, skipping plain-text copy.[/yellow]")
-        break
+            console.print(f"[dim]{exc}[/dim]")
 
 
 # ---------------------------------------------------------------------------

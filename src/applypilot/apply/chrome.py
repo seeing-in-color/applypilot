@@ -103,6 +103,14 @@ def setup_worker_profile(worker_id: int) -> Path:
     On first run, clones from an existing worker profile (preferred, since
     it already has session cookies) or from the user's real Chrome profile.
     Subsequent runs reuse the existing worker profile.
+    
+    Env overrides:
+    - ``APPLYPILOT_CHROME_SEED_USER_DATA_DIR``: Chrome user-data directory to seed
+      from on first initialization (defaults to the OS Chrome user-data dir).
+    - ``APPLYPILOT_CHROME_SEED_PROFILE_DIR``: Profile subdir inside the seed
+      user-data dir to copy into the worker profile as ``Default`` (e.g.
+      ``Profile 39``). This is the safest way to reuse a logged-in LinkedIn
+      session without pointing automation at your live Chrome profile.
 
     Args:
         worker_id: Numeric worker identifier.
@@ -124,7 +132,36 @@ def setup_worker_profile(worker_id: int) -> Path:
             source = candidate
             break
     if source is None:
-        source = config.get_chrome_user_data()
+        import os
+        seed_user_data = os.environ.get("APPLYPILOT_CHROME_SEED_USER_DATA_DIR", "").strip()
+        source = Path(seed_user_data).expanduser() if seed_user_data else config.get_chrome_user_data()
+
+    # Optional: seed from a specific Chrome profile dir (copy it as Default).
+    import os
+    seed_profile_dir = os.environ.get("APPLYPILOT_CHROME_SEED_PROFILE_DIR", "").strip()
+    if seed_profile_dir and source and (source / seed_profile_dir).exists():
+        logger.info(
+            "[worker-%d] Seeding Chrome profile from %s/%s (first time setup)...",
+            worker_id,
+            source.name,
+            seed_profile_dir,
+        )
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            # Copy the selected profile directory into worker as Default.
+            shutil.copytree(
+                str(source / seed_profile_dir),
+                str(profile_dir / "Default"),
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("Cache", "Code Cache", "GPUCache", "Service Worker"),
+            )
+            # Copy Local State when present (some profile metadata lives there).
+            if (source / "Local State").exists():
+                shutil.copy2(str(source / "Local State"), str(profile_dir / "Local State"))
+            return profile_dir
+        except Exception:
+            # Fall back to the broader copy approach below.
+            logger.debug("Seed-profile copy failed; falling back to full clone", exc_info=True)
 
     logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
                 worker_id, source.name)
@@ -211,11 +248,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     chrome_exe = config.get_chrome_path()
 
+    import os
+    profile_subdir = os.environ.get("APPLYPILOT_CHROME_PROFILE_DIR", "").strip() or "Default"
+
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
-        "--profile-directory=Default",
+        f"--profile-directory={profile_subdir}",
         "--no-first-run",
         "--no-default-browser-check",
         "--window-size=1024,768",
@@ -234,6 +274,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
     ]
     if headless:
         cmd.append("--headless=new")
+    else:
+        # Keep headed runs fullscreen for easier visual monitoring/debugging.
+        cmd.extend(["--start-maximized", "--start-fullscreen"])
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

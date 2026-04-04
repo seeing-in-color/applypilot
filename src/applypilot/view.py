@@ -12,6 +12,7 @@ Generates a self-contained HTML dashboard with:
 from __future__ import annotations
 
 import os
+import json
 import webbrowser
 from html import escape
 from pathlib import Path
@@ -143,6 +144,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
     """).fetchall()
 
     master_rows = ""
+    reasoning_map: dict[str, dict[str, str]] = {}
+    reason_seq = 0
     for j in all_jobs_list:
         title = j["title"] or "Untitled"
         url = _strip_bad_url_value(j["url"])
@@ -157,6 +160,22 @@ def generate_dashboard(output_path: str | None = None) -> str:
         fs = j["fit_score"]
         score_cell = str(fs) if fs is not None else "—"
         score_attr = "" if fs is None else str(int(fs))
+        reason_raw = j["score_reasoning"] or ""
+        reason_id = ""
+        why_cell = "—"
+        if reason_raw.strip():
+            reason_seq += 1
+            reason_id = f"reason-{reason_seq}"
+            reason_lines = [ln.strip() for ln in str(reason_raw).split("\n") if ln.strip()]
+            reasoning_map[reason_id] = {
+                "raw": str(reason_raw),
+                "keywords": reason_lines[0] if reason_lines else "",
+                "reasoning": reason_lines[1] if len(reason_lines) > 1 else (reason_lines[0] if reason_lines else ""),
+            }
+            why_cell = (
+                f'<button class="why-btn" type="button" '
+                f'onclick="openReasoningModal(\'{reason_id}\')">Why this score</button>'
+            )
         has_desc = "Yes" if desc else "No"
         desc_len = len(desc)
         disc = (j["discovered_at"] or "")[:16]
@@ -192,6 +211,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
           <td class="cell-center">{has_desc}{f" ({desc_len:,} chars)" if desc else ""}</td>
           <td class="cell-center">{apply_cell}</td>
           <td class="cell-center master-score">{score_cell}</td>
+          <td class="cell-center">{why_cell}</td>
           <td class="cell-muted cell-tiny">{escape(disc) if disc else "—"}</td>
           <td class="cell-muted cell-tiny">{escape(scraped) if scraped else "—"}</td>
           <td class="cell-error" title="{escape(derr)}">{err_short if derr else "—"}</td>
@@ -288,6 +308,16 @@ def generate_dashboard(output_path: str | None = None) -> str:
         reasoning_lines = reasoning_raw.split("\n")
         keywords = reasoning_lines[0][:120] if reasoning_lines else ""
         reasoning = reasoning_lines[1][:200] if len(reasoning_lines) > 1 else ""
+        card_reason_id = ""
+        if reasoning_raw.strip():
+            reason_seq += 1
+            card_reason_id = f"reason-{reason_seq}"
+            reason_lines = [ln.strip() for ln in str(reasoning_raw).split("\n") if ln.strip()]
+            reasoning_map[card_reason_id] = {
+                "raw": str(reasoning_raw),
+                "keywords": reason_lines[0] if reason_lines else "",
+                "reasoning": reason_lines[1] if len(reason_lines) > 1 else (reason_lines[0] if reason_lines else ""),
+            }
 
         desc_preview = escape(j["full_description"] or "")[:300]
         full_desc_html = escape(j["full_description"] or "").replace("\n", "<br>")
@@ -306,6 +336,12 @@ def generate_dashboard(output_path: str | None = None) -> str:
         apply_html = ""
         if apply_url:
             apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>'
+        why_html = (
+            f'<button class="why-btn" type="button" onclick="openReasoningModal(\'{card_reason_id}\')">'
+            "Why this score</button>"
+            if card_reason_id
+            else ""
+        )
 
         title_link = (
             f'<a href="{url}" class="job-title" target="_blank">{title}</a>'
@@ -323,7 +359,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
           {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
           <p class="desc-preview">{desc_preview}...</p>
           {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
-          <div class="card-footer">{apply_html}</div>
+          <div class="card-footer">{why_html}{apply_html}</div>
         </div>"""
 
     if current_score is not None:
@@ -454,6 +490,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .card-footer {{ display: flex; justify-content: flex-end; }}
   .apply-link {{ font-size: 0.8rem; color: #60a5fa; text-decoration: none; padding: 0.3rem 0.8rem; border: 1px solid #60a5fa33; border-radius: 6px; font-weight: 500; }}
   .apply-link:hover {{ background: #60a5fa22; }}
+  .why-btn {{ font-size: 0.75rem; color: #93c5fd; background: #1e3a5f; border: 1px solid #60a5fa55; border-radius: 6px; padding: 0.26rem 0.6rem; cursor: pointer; }}
+  .why-btn:hover {{ background: #264a77; }}
 
   /* Expandable full description */
   .full-desc-details {{ margin-bottom: 0.75rem; }}
@@ -464,6 +502,22 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
   .hidden {{ display: none !important; }}
   .job-count {{ color: #94a3b8; font-size: 0.85rem; margin-bottom: 1rem; }}
+  .card-footer {{ display: flex; justify-content: flex-end; gap: 0.45rem; flex-wrap: wrap; }}
+
+  /* Reasoning modal */
+  .modal-backdrop {{ position: fixed; inset: 0; background: rgba(2, 6, 23, 0.75); display: none; align-items: center; justify-content: center; z-index: 9999; }}
+  .modal-backdrop.open {{ display: flex; }}
+  .modal-card {{ width: min(900px, 92vw); max-height: 80vh; background: #0f172a; border: 1px solid #334155; border-radius: 10px; box-shadow: 0 18px 45px rgba(0,0,0,.45); overflow: hidden; }}
+  .modal-head {{ display: flex; align-items: center; justify-content: space-between; padding: 0.8rem 1rem; border-bottom: 1px solid #334155; }}
+  .modal-title {{ color: #cbd5e1; font-weight: 600; }}
+  .modal-close {{ background: #334155; border: 1px solid #475569; color: #cbd5e1; border-radius: 6px; padding: 0.25rem 0.55rem; cursor: pointer; }}
+  .modal-body {{ padding: 1rem; color: #e2e8f0; line-height: 1.55; white-space: normal; overflow: auto; max-height: calc(80vh - 58px); }}
+  .reason-section {{ margin-bottom: 0.45rem; }}
+  .reason-title {{ font-size: 0.78rem; color: #94a3b8; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.18rem; }}
+  .reason-text {{ font-size: 0.9rem; color: #e2e8f0; line-height: 1.6; white-space: pre-wrap; }}
+  .reason-list {{ margin: 0.12rem 0 0 1rem; padding: 0; }}
+  .reason-list li {{ margin: 0.14rem 0; line-height: 1.45; color: #cbd5e1; }}
+  .reason-empty {{ color: #64748b; font-style: italic; }}
 
   @media (max-width: 768px) {{
     .summary {{ grid-template-columns: repeat(2, 1fr); }}
@@ -525,6 +579,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
           <th>Full desc</th>
           <th>Apply URL</th>
           <th>Score</th>
+          <th>Why score?</th>
           <th>Discovered</th>
           <th>Detail scraped</th>
           <th>Error</th>
@@ -555,10 +610,21 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
 {job_sections}
 
+<div id="reasoning-modal" class="modal-backdrop" onclick="if(event.target===this) closeReasoningModal()">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="reasoning-title">
+    <div class="modal-head">
+      <div id="reasoning-title" class="modal-title">Why this score / ranking</div>
+      <button type="button" class="modal-close" onclick="closeReasoningModal()">Close</button>
+    </div>
+    <div id="reasoning-content" class="modal-body"></div>
+  </div>
+</div>
+
 <script>
 let minScore = 0;
 let exactScore = null;
 let searchText = '';
+const REASONING_MAP = {json.dumps(reasoning_map)};
 
 function filterScore(min, btn) {{
   minScore = min;
@@ -617,6 +683,88 @@ function scrollToScored() {{
   if (!el) return;
   el.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
 }}
+
+function openReasoningModal(reasonId) {{
+  const modal = document.getElementById('reasoning-modal');
+  const body = document.getElementById('reasoning-content');
+  if (!modal || !body) return;
+  const payload = REASONING_MAP[reasonId] || null;
+  if (!payload) {{
+    body.innerHTML = '<div class="reason-empty">No reasoning available.</div>';
+    modal.classList.add('open');
+    return;
+  }}
+
+  const esc = (v) => String(v || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('\"', '&quot;')
+    .replaceAll(\"'\", '&#39;');
+
+  const reasoning = String(payload.reasoning || payload.raw || '').trim();
+  const keywords = String(payload.keywords || '').trim();
+  const sentences = reasoning
+    .split(/(?<=[.!?])\\s+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const missTriggers = ['lack', 'missing', 'gap', 'insufficient', 'limited', 'not', 'without', 'does not', \"doesn't\", 'unclear'];
+  const strong = [];
+  const missing = [];
+  for (const s of sentences) {{
+    const low = s.toLowerCase();
+    if (missTriggers.some(t => low.includes(t))) {{
+      missing.push(s);
+    }} else {{
+      strong.push(s);
+    }}
+  }}
+
+  // Use keyword matches as explicit strengths when present.
+  const kwList = keywords
+    .split(',')
+    .map(k => k.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+  for (const kw of kwList) {{
+    strong.unshift(`Matches job keyword: ${{kw}}`);
+  }}
+
+  const uniq = (arr) => [...new Set(arr.map(s => s.trim()).filter(Boolean))];
+  const strongOut = uniq(strong).slice(0, 8);
+  const missingOut = uniq(missing).slice(0, 8);
+
+  const listHtml = (items) => items.length
+    ? `<ul class="reason-list">${{items.map(i => `<li>${{esc(i)}}</li>`).join('')}}</ul>`
+    : '<div class="reason-empty">None explicitly identified in the current rationale.</div>';
+
+  body.innerHTML = `
+    <div class="reason-section">
+      <div class="reason-title">Overall</div>
+      <div class="reason-text">${{esc(reasoning || 'No reasoning text available.')}}</div>
+    </div>
+    <div class="reason-section">
+      <div class="reason-title">Strong</div>
+      ${{listHtml(strongOut)}}
+    </div>
+    <div class="reason-section">
+      <div class="reason-title">Missing</div>
+      ${{listHtml(missingOut)}}
+    </div>
+  `;
+  modal.classList.add('open');
+}}
+
+function closeReasoningModal() {{
+  const modal = document.getElementById('reasoning-modal');
+  if (!modal) return;
+  modal.classList.remove('open');
+}}
+
+document.addEventListener('keydown', (e) => {{
+  if (e.key === 'Escape') closeReasoningModal();
+}});
 
 function masterRowScoreMatch(row) {{
   const raw = row.getAttribute('data-score');

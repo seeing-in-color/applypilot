@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
+from applypilot.config import RESUME_PATH, RESUME_PDF_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
@@ -455,8 +455,8 @@ def tailor_resume(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_tailoring(min_score: int = 7, limit: int = 20,
-                  validation_mode: str = "normal") -> dict:
+def run_tailoring_legacy(min_score: int = 7, limit: int = 20,
+                         validation_mode: str = "normal") -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
@@ -588,3 +588,147 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         "errors": stats.get("error", 0),
         "elapsed": elapsed,
     }
+
+
+def _keywords_from_job(job: dict) -> list[str]:
+    """Extract keyword list from score_reasoning first line; fallback to title tokens."""
+    sr = str(job.get("score_reasoning") or "").strip()
+    if sr:
+        first = sr.splitlines()[0].strip()
+        if first:
+            parts = [p.strip() for p in first.split(",") if p.strip()]
+            if parts:
+                return parts[:16]
+    title = str(job.get("title") or "").strip()
+    if not title:
+        return []
+    toks = [t for t in re.split(r"\W+", title) if len(t) > 2]
+    return toks[:8]
+
+
+def _overlay_keywords_top_right(base_pdf: Path, out_pdf: Path, keywords: list[str]) -> None:
+    """Overlay keywords text box on top-right of first page of a PDF."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from reportlab.pdfgen import canvas
+    except Exception as exc:
+        raise RuntimeError(
+            "PDF overlay dependencies missing. Install `pypdf` and `reportlab`."
+        ) from exc
+
+    if not base_pdf.exists():
+        raise FileNotFoundError(f"Base resume PDF not found: {base_pdf}")
+
+    import tempfile
+
+    reader = PdfReader(str(base_pdf))
+    if not reader.pages:
+        raise ValueError(f"Base PDF has no pages: {base_pdf}")
+
+    p0 = reader.pages[0]
+    width = float(p0.mediabox.width)
+    height = float(p0.mediabox.height)
+
+    box_w = min(220.0, width * 0.30)
+    x = width - box_w - 6.0
+    y_top = height - 4.0
+    line_h = 7.0
+
+    lines = ["HIRE", "hire", "Hire"] + [k for k in keywords[:14]]
+    box_h = max(40.0, 6.0 + line_h * len(lines))
+    y = y_top - box_h
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        overlay_path = Path(tmp.name)
+    try:
+        c = canvas.Canvas(str(overlay_path), pagesize=(width, height))
+        # Transparent overlay region: draw text only (no box fill/border).
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica", 6)
+        y_line = y_top - 6
+        right_x = x + box_w - 3
+        for ln in lines:
+            c.drawRightString(right_x, y_line, ln)
+            y_line -= line_h
+        c.showPage()
+        c.save()
+
+        overlay_reader = PdfReader(str(overlay_path))
+        overlay_page = overlay_reader.pages[0]
+        writer = PdfWriter()
+        for i, page in enumerate(reader.pages):
+            if i == 0:
+                page.merge_page(overlay_page)
+            writer.add_page(page)
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        with out_pdf.open("wb") as f:
+            writer.write(f)
+    finally:
+        try:
+            overlay_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def run_tailoring(min_score: int = 7, limit: int = 20, validation_mode: str = "normal") -> dict:
+    """Production tailoring: keep original resume PDF, add top-right keyword textbox.
+
+    Legacy LLM rewrite flow remains available via ``run_tailoring_legacy``.
+    """
+    _ = validation_mode  # retained for CLI compatibility
+    conn = get_connection()
+    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+    if not jobs:
+        log.info("No untailored jobs with score >= %d.", min_score)
+        return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
+
+    TAILORED_DIR.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    approved = 0
+    failed = 0
+    errors = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for idx, job in enumerate(jobs, start=1):
+        safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
+        safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+        prefix = f"{safe_site}_{safe_title}"
+        txt_path = TAILORED_DIR / f"{prefix}.txt"
+        pdf_path = txt_path.with_suffix(".pdf")
+        keywords = _keywords_from_job(job)
+        try:
+            _overlay_keywords_top_right(RESUME_PDF_PATH, pdf_path, keywords)
+            txt_path.write_text(
+                "Keyword overlay resume.\n\n"
+                f"Source PDF: {RESUME_PDF_PATH}\n"
+                f"Keywords: {', '.join(keywords)}\n"
+                f"Job: {job['title']}\nURL: {job['url']}\n",
+                encoding="utf-8",
+            )
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (str(txt_path), now, job["url"]),
+            )
+            conn.commit()
+            approved += 1
+            log.info(
+                "%d/%d [APPROVED] keyword-overlay PDF | %s",
+                idx, len(jobs), job["title"][:50],
+            )
+        except Exception as exc:
+            conn.execute(
+                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (job["url"],),
+            )
+            conn.commit()
+            errors += 1
+            failed += 1
+            log.error("%d/%d [ERROR] %s -- %s", idx, len(jobs), job["title"][:50], exc)
+
+    elapsed = time.time() - t0
+    log.info(
+        "Production tailoring done in %.1fs: %d approved, %d failed, %d errors",
+        elapsed, approved, failed, errors,
+    )
+    return {"approved": approved, "failed": failed, "errors": errors, "elapsed": elapsed}
