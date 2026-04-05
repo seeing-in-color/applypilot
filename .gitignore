@@ -45,3 +45,10 @@ Thumbs.db
 
 # Personal resume dumps in repo root
 Resume_*.pdf
+
+# Node.js / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.vite/
+*.tsbuildinfo
