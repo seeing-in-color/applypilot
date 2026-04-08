@@ -1,8 +1,6 @@
-[phases.setup]
-nixPkgs = ["python311", "pip"]
-
+# Install from pyproject.toml (includes package + dependencies)
 [phases.install]
-cmds = ["pip install -r requirements.txt", "pip install -e ."]
+cmds = ["pip install ."]
 
 [start]
-cmd = "uvicorn src.applypilot.webapp.api:app --host 0.0.0.0 --port $PORT"
+cmd = "uvicorn src.applypilot.webapp.api:app --host 0.0.0.0 --port ${PORT:-8000}"
