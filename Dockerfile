@@ -14,8 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
-# Install the package
-RUN pip install --no-cache-dir .
+# Add src to Python path so applypilot module is found
+ENV PYTHONPATH=/app/src
 
 # Expose port
 EXPOSE 8000
