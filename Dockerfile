@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Install the package
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir .
 
 # Expose port
 EXPOSE 8000
