@@ -23,25 +23,30 @@ from applypilot.database import get_connection, init_db
 # Supabase Support (for production deployment)
 # ---------------------------------------------------------------------------
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY")
+def get_supabase_url():
+    return os.environ.get("SUPABASE_URL")
+
+def get_supabase_key():
+    return os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY")
 
 _supabase_client = None
 
 def get_supabase():
     """Get Supabase client (lazy initialization)."""
     global _supabase_client
-    if _supabase_client is None and SUPABASE_URL and SUPABASE_KEY:
+    url = get_supabase_url()
+    key = get_supabase_key()
+    if _supabase_client is None and url and key:
         try:
             from supabase import create_client
-            _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            _supabase_client = create_client(url, key)
         except ImportError:
             pass
     return _supabase_client
 
 def use_supabase() -> bool:
     """Check if Supabase should be used (production mode)."""
-    return bool(SUPABASE_URL and SUPABASE_KEY and get_supabase())
+    return bool(get_supabase_url() and get_supabase_key() and get_supabase())
 
 
 # ---------------------------------------------------------------------------
@@ -151,12 +156,15 @@ async def debug_config():
     except ImportError:
         pass
     
+    url = get_supabase_url()
+    key = get_supabase_key()
     return {
-        "supabase_url_set": bool(SUPABASE_URL),
-        "supabase_key_set": bool(SUPABASE_KEY),
+        "supabase_url_set": bool(url),
+        "supabase_key_set": bool(key),
         "supabase_lib_installed": has_supabase_lib,
         "use_supabase": use_supabase(),
-        "supabase_url_preview": SUPABASE_URL[:30] + "..." if SUPABASE_URL and len(SUPABASE_URL) > 30 else SUPABASE_URL,
+        "supabase_url_preview": url[:30] + "..." if url and len(url) > 30 else url,
+        "all_env_vars": list(os.environ.keys()),
     }
 
 
