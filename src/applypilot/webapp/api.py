@@ -138,6 +138,29 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Debug endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/debug/config")
+async def debug_config():
+    """Debug endpoint to check configuration."""
+    has_supabase_lib = False
+    try:
+        from supabase import create_client
+        has_supabase_lib = True
+    except ImportError:
+        pass
+    
+    return {
+        "supabase_url_set": bool(SUPABASE_URL),
+        "supabase_key_set": bool(SUPABASE_KEY),
+        "supabase_lib_installed": has_supabase_lib,
+        "use_supabase": use_supabase(),
+        "supabase_url_preview": SUPABASE_URL[:30] + "..." if SUPABASE_URL and len(SUPABASE_URL) > 30 else SUPABASE_URL,
+    }
+
+
+# ---------------------------------------------------------------------------
 # API Routes - Dashboard Stats
 # ---------------------------------------------------------------------------
 
