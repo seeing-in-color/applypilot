@@ -19,6 +19,30 @@ from pydantic import BaseModel
 from applypilot.config import APP_DIR, PROFILE_PATH, RESUME_PATH, load_env
 from applypilot.database import get_connection, init_db
 
+# ---------------------------------------------------------------------------
+# Supabase Support (for production deployment)
+# ---------------------------------------------------------------------------
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY")
+
+_supabase_client = None
+
+def get_supabase():
+    """Get Supabase client (lazy initialization)."""
+    global _supabase_client
+    if _supabase_client is None and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            from supabase import create_client
+            _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except ImportError:
+            pass
+    return _supabase_client
+
+def use_supabase() -> bool:
+    """Check if Supabase should be used (production mode)."""
+    return bool(SUPABASE_URL and SUPABASE_KEY and get_supabase())
+
 
 # ---------------------------------------------------------------------------
 # Pydantic Models
@@ -120,42 +144,56 @@ app.add_middleware(
 @app.get("/api/stats", response_model=StatsResponse)
 async def get_stats():
     """Get dashboard statistics."""
-    conn = get_connection()
-    
-    total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    enriched = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL"
-    ).fetchone()[0]
-    scored = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
-    ).fetchone()[0]
-    high_fit = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
-    ).fetchone()[0]
-    mid_fit = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score BETWEEN 5 AND 6"
-    ).fetchone()[0]
-    low_fit = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND fit_score < 5"
-    ).fetchone()[0]
-    applied = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
-    ).fetchone()[0]
-    failed = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'failed'"
-    ).fetchone()[0]
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'needs_input'"
-    ).fetchone()[0]
-    interviews = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'interview'"
-    ).fetchone()[0]
-    offers = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'offer'"
-    ).fetchone()[0]
-    rejected = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'rejected'"
-    ).fetchone()[0]
+    if use_supabase():
+        sb = get_supabase()
+        total = sb.table("jobs").select("*", count="exact").execute().count or 0
+        enriched = sb.table("jobs").select("*", count="exact").not_.is_("full_description", "null").execute().count or 0
+        scored = sb.table("jobs").select("*", count="exact").not_.is_("fit_score", "null").execute().count or 0
+        high_fit = sb.table("jobs").select("*", count="exact").gte("fit_score", 7).execute().count or 0
+        mid_fit = sb.table("jobs").select("*", count="exact").gte("fit_score", 5).lt("fit_score", 7).execute().count or 0
+        low_fit = sb.table("jobs").select("*", count="exact").not_.is_("fit_score", "null").lt("fit_score", 5).execute().count or 0
+        applied = sb.table("jobs").select("*", count="exact").not_.is_("applied_at", "null").execute().count or 0
+        failed = sb.table("jobs").select("*", count="exact").eq("apply_status", "failed").execute().count or 0
+        pending = sb.table("jobs").select("*", count="exact").eq("apply_status", "needs_input").execute().count or 0
+        interviews = sb.table("jobs").select("*", count="exact").eq("apply_status", "interview").execute().count or 0
+        offers = sb.table("jobs").select("*", count="exact").eq("apply_status", "offer").execute().count or 0
+        rejected = sb.table("jobs").select("*", count="exact").eq("apply_status", "rejected").execute().count or 0
+    else:
+        conn = get_connection()
+        total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        enriched = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL"
+        ).fetchone()[0]
+        scored = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
+        ).fetchone()[0]
+        high_fit = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
+        ).fetchone()[0]
+        mid_fit = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE fit_score BETWEEN 5 AND 6"
+        ).fetchone()[0]
+        low_fit = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND fit_score < 5"
+        ).fetchone()[0]
+        applied = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
+        ).fetchone()[0]
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'failed'"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'needs_input'"
+        ).fetchone()[0]
+        interviews = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'interview'"
+        ).fetchone()[0]
+        offers = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'offer'"
+        ).fetchone()[0]
+        rejected = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'rejected'"
+        ).fetchone()[0]
     
     return StatsResponse(
         total_discovered=total,
@@ -188,56 +226,98 @@ async def get_jobs(
     offset: int = 0,
 ):
     """Get jobs with optional filtering."""
-    conn = get_connection()
-    
-    query = "SELECT * FROM jobs WHERE 1=1"
-    params: list = []
-    
-    if status:
-        if status == "qualified":
-            query += " AND fit_score >= 7"
-        elif status == "needs_input":
-            query += " AND apply_status = 'needs_input'"
-        elif status == "applied":
-            query += " AND applied_at IS NOT NULL"
-        elif status == "interview":
-            query += " AND apply_status = 'interview'"
-        elif status == "rejected":
-            query += " AND apply_status = 'rejected'"
-        else:
-            query += " AND apply_status = ?"
-            params.append(status)
-    
-    if min_score is not None:
-        query += " AND fit_score >= ?"
-        params.append(min_score)
-    
-    if max_score is not None:
-        query += " AND fit_score <= ?"
-        params.append(max_score)
-    
-    if site:
-        query += " AND site = ?"
-        params.append(site)
-    
-    if search:
-        query += " AND (title LIKE ? OR description LIKE ? OR location LIKE ?)"
-        search_term = f"%{search}%"
-        params.extend([search_term, search_term, search_term])
-    
-    query += " ORDER BY discovered_at DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-    
-    rows = conn.execute(query, params).fetchall()
-    
-    jobs = []
-    for row in rows:
-        job = dict(row)
-        # Extract company from site or title if available
-        job["company"] = _extract_company(job)
-        jobs.append(job)
-    
-    return {"jobs": jobs, "total": len(jobs)}
+    if use_supabase():
+        sb = get_supabase()
+        query = sb.table("jobs").select("*")
+        
+        if status:
+            if status == "qualified":
+                query = query.gte("fit_score", 7)
+            elif status == "needs_input":
+                query = query.eq("apply_status", "needs_input")
+            elif status == "applied":
+                query = query.not_.is_("applied_at", "null")
+            elif status == "interview":
+                query = query.eq("apply_status", "interview")
+            elif status == "rejected":
+                query = query.eq("apply_status", "rejected")
+            else:
+                query = query.eq("apply_status", status)
+        
+        if min_score is not None:
+            query = query.gte("fit_score", min_score)
+        
+        if max_score is not None:
+            query = query.lte("fit_score", max_score)
+        
+        if site:
+            query = query.eq("site", site)
+        
+        if search:
+            query = query.or_(f"title.ilike.%{search}%,description.ilike.%{search}%,location.ilike.%{search}%")
+        
+        query = query.order("discovered_at", desc=True).range(offset, offset + limit - 1)
+        result = query.execute()
+        
+        jobs = []
+        for row in result.data:
+            job = dict(row)
+            job["company"] = _extract_company(job)
+            jobs.append(job)
+        
+        return {"jobs": jobs, "total": len(jobs)}
+    else:
+        conn = get_connection()
+        
+        query = "SELECT * FROM jobs WHERE 1=1"
+        params: list = []
+        
+        if status:
+            if status == "qualified":
+                query += " AND fit_score >= 7"
+            elif status == "needs_input":
+                query += " AND apply_status = 'needs_input'"
+            elif status == "applied":
+                query += " AND applied_at IS NOT NULL"
+            elif status == "interview":
+                query += " AND apply_status = 'interview'"
+            elif status == "rejected":
+                query += " AND apply_status = 'rejected'"
+            else:
+                query += " AND apply_status = ?"
+                params.append(status)
+        
+        if min_score is not None:
+            query += " AND fit_score >= ?"
+            params.append(min_score)
+        
+        if max_score is not None:
+            query += " AND fit_score <= ?"
+            params.append(max_score)
+        
+        if site:
+            query += " AND site = ?"
+            params.append(site)
+        
+        if search:
+            query += " AND (title LIKE ? OR description LIKE ? OR location LIKE ?)"
+            search_term = f"%{search}%"
+            params.extend([search_term, search_term, search_term])
+        
+        query += " ORDER BY discovered_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        
+        rows = conn.execute(query, params).fetchall()
+        
+        jobs = []
+        for row in rows:
+            job = dict(row)
+            # Extract company from site or title if available
+            job["company"] = _extract_company(job)
+            jobs.append(job)
+        
+        return {"jobs": jobs, "total": len(jobs)}
+
 
 
 def _extract_company(job: dict) -> str:
@@ -272,31 +352,45 @@ def _extract_company(job: dict) -> str:
 @app.get("/api/jobs/{job_url:path}")
 async def get_job(job_url: str):
     """Get a single job by URL."""
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job_url,)).fetchone()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = dict(row)
-    job["company"] = _extract_company(job)
-    return job
+    if use_supabase():
+        sb = get_supabase()
+        result = sb.table("jobs").select("*").eq("url", job_url).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        job = dict(result.data[0])
+        job["company"] = _extract_company(job)
+        return job
+    else:
+        conn = get_connection()
+        row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job_url,)).fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        job = dict(row)
+        job["company"] = _extract_company(job)
+        return job
 
 
 @app.patch("/api/jobs/{job_url:path}/status")
 async def update_job_status(job_url: str, update: JobStatusUpdate):
     """Update job application status."""
-    conn = get_connection()
-    
     valid_statuses = ["discovered", "scored", "qualified", "applied", "failed", "rejected", "interview", "offer", "needs_input"]
     if update.status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid_statuses}")
     
-    conn.execute(
-        "UPDATE jobs SET apply_status = ? WHERE url = ?",
-        (update.status, job_url)
-    )
-    conn.commit()
+    if use_supabase():
+        sb = get_supabase()
+        sb.table("jobs").update({"apply_status": update.status}).eq("url", job_url).execute()
+    else:
+        conn = get_connection()
+        conn.execute(
+            "UPDATE jobs SET apply_status = ? WHERE url = ?",
+            (update.status, job_url)
+        )
+        conn.commit()
     
     return {"message": "Status updated", "status": update.status}
 
@@ -304,22 +398,37 @@ async def update_job_status(job_url: str, update: JobStatusUpdate):
 @app.get("/api/jobs/needs-input")
 async def get_jobs_needing_input():
     """Get jobs that need manual intervention."""
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT * FROM jobs 
-        WHERE apply_status = 'needs_input' 
-           OR (apply_error IS NOT NULL AND apply_status != 'applied')
-        ORDER BY last_attempted_at DESC
-    """).fetchall()
-    
-    jobs = []
-    for row in rows:
-        job = dict(row)
-        job["company"] = _extract_company(job)
-        job["reason"] = _determine_input_reason(job)
-        jobs.append(job)
-    
-    return {"jobs": jobs}
+    if use_supabase():
+        sb = get_supabase()
+        result = sb.table("jobs").select("*").or_("apply_status.eq.needs_input,apply_error.not.is.null").order("last_attempted_at", desc=True).execute()
+        
+        jobs = []
+        for row in result.data:
+            job = dict(row)
+            if job.get("apply_status") == "applied":
+                continue
+            job["company"] = _extract_company(job)
+            job["reason"] = _determine_input_reason(job)
+            jobs.append(job)
+        
+        return {"jobs": jobs}
+    else:
+        conn = get_connection()
+        rows = conn.execute("""
+            SELECT * FROM jobs 
+            WHERE apply_status = 'needs_input' 
+               OR (apply_error IS NOT NULL AND apply_status != 'applied')
+            ORDER BY last_attempted_at DESC
+        """).fetchall()
+        
+        jobs = []
+        for row in rows:
+            job = dict(row)
+            job["company"] = _extract_company(job)
+            job["reason"] = _determine_input_reason(job)
+            jobs.append(job)
+        
+        return {"jobs": jobs}
 
 
 def _determine_input_reason(job: dict) -> str:
@@ -516,11 +625,17 @@ async def run_apply(
 @app.post("/api/pipeline/apply/{job_url:path}")
 async def apply_to_job(job_url: str, background_tasks: BackgroundTasks, dry_run: bool = False):
     """Apply to a specific job."""
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job_url,)).fetchone()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="Job not found")
+    # Check if job exists
+    if use_supabase():
+        sb = get_supabase()
+        result = sb.table("jobs").select("url").eq("url", job_url).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Job not found")
+    else:
+        conn = get_connection()
+        row = conn.execute("SELECT * FROM jobs WHERE url = ?", (job_url,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found")
     
     from applypilot.apply.launcher import main as apply_main
     
@@ -630,67 +745,105 @@ async def authenticate_email():
 @app.get("/api/activity")
 async def get_activity(limit: int = 50):
     """Get recent activity log."""
-    conn = get_connection()
-    
-    # Get recent job status changes
     activities = []
     
-    # Recently discovered
-    discovered = conn.execute("""
-        SELECT url, title, site, discovered_at as timestamp, 'discovered' as action
-        FROM jobs
-        WHERE discovered_at IS NOT NULL
-        ORDER BY discovered_at DESC
-        LIMIT 10
-    """).fetchall()
-    
-    for row in discovered:
-        activities.append({
-            "type": "discovered",
-            "job_url": row["url"],
-            "job_title": row["title"],
-            "site": row["site"],
-            "timestamp": row["timestamp"],
-            "message": f"Discovered: {row['title'] or 'Untitled'} at {row['site'] or 'Unknown'}"
-        })
-    
-    # Recently scored
-    scored = conn.execute("""
-        SELECT url, title, fit_score, scored_at as timestamp
-        FROM jobs
-        WHERE scored_at IS NOT NULL
-        ORDER BY scored_at DESC
-        LIMIT 10
-    """).fetchall()
-    
-    for row in scored:
-        activities.append({
-            "type": "scored",
-            "job_url": row["url"],
-            "job_title": row["title"],
-            "score": row["fit_score"],
-            "timestamp": row["timestamp"],
-            "message": f"Scored: {row['title'] or 'Untitled'} - {row['fit_score']}/10"
-        })
-    
-    # Recently applied
-    applied = conn.execute("""
-        SELECT url, title, applied_at as timestamp, apply_status
-        FROM jobs
-        WHERE applied_at IS NOT NULL
-        ORDER BY applied_at DESC
-        LIMIT 10
-    """).fetchall()
-    
-    for row in applied:
-        activities.append({
-            "type": "applied",
-            "job_url": row["url"],
-            "job_title": row["title"],
-            "status": row["apply_status"],
-            "timestamp": row["timestamp"],
-            "message": f"Applied: {row['title'] or 'Untitled'}"
-        })
+    if use_supabase():
+        sb = get_supabase()
+        
+        # Recently discovered
+        discovered = sb.table("jobs").select("url,title,site,discovered_at").not_.is_("discovered_at", "null").order("discovered_at", desc=True).limit(10).execute()
+        for row in discovered.data:
+            activities.append({
+                "type": "discovered",
+                "job_url": row["url"],
+                "job_title": row["title"],
+                "site": row["site"],
+                "timestamp": row["discovered_at"],
+                "message": f"Discovered: {row['title'] or 'Untitled'} at {row['site'] or 'Unknown'}"
+            })
+        
+        # Recently scored
+        scored = sb.table("jobs").select("url,title,fit_score,scored_at").not_.is_("scored_at", "null").order("scored_at", desc=True).limit(10).execute()
+        for row in scored.data:
+            activities.append({
+                "type": "scored",
+                "job_url": row["url"],
+                "job_title": row["title"],
+                "score": row["fit_score"],
+                "timestamp": row["scored_at"],
+                "message": f"Scored: {row['title'] or 'Untitled'} - {row['fit_score']}/10"
+            })
+        
+        # Recently applied
+        applied = sb.table("jobs").select("url,title,applied_at,apply_status").not_.is_("applied_at", "null").order("applied_at", desc=True).limit(10).execute()
+        for row in applied.data:
+            activities.append({
+                "type": "applied",
+                "job_url": row["url"],
+                "job_title": row["title"],
+                "status": row["apply_status"],
+                "timestamp": row["applied_at"],
+                "message": f"Applied: {row['title'] or 'Untitled'}"
+            })
+    else:
+        conn = get_connection()
+        
+        # Recently discovered
+        discovered = conn.execute("""
+            SELECT url, title, site, discovered_at as timestamp, 'discovered' as action
+            FROM jobs
+            WHERE discovered_at IS NOT NULL
+            ORDER BY discovered_at DESC
+            LIMIT 10
+        """).fetchall()
+        
+        for row in discovered:
+            activities.append({
+                "type": "discovered",
+                "job_url": row["url"],
+                "job_title": row["title"],
+                "site": row["site"],
+                "timestamp": row["timestamp"],
+                "message": f"Discovered: {row['title'] or 'Untitled'} at {row['site'] or 'Unknown'}"
+            })
+        
+        # Recently scored
+        scored = conn.execute("""
+            SELECT url, title, fit_score, scored_at as timestamp
+            FROM jobs
+            WHERE scored_at IS NOT NULL
+            ORDER BY scored_at DESC
+            LIMIT 10
+        """).fetchall()
+        
+        for row in scored:
+            activities.append({
+                "type": "scored",
+                "job_url": row["url"],
+                "job_title": row["title"],
+                "score": row["fit_score"],
+                "timestamp": row["timestamp"],
+                "message": f"Scored: {row['title'] or 'Untitled'} - {row['fit_score']}/10"
+            })
+        
+        # Recently applied
+        applied = conn.execute("""
+            SELECT url, title, applied_at as timestamp, apply_status
+            FROM jobs
+            WHERE applied_at IS NOT NULL
+            ORDER BY applied_at DESC
+            LIMIT 10
+        """).fetchall()
+        
+        for row in applied:
+            activities.append({
+                "type": "applied",
+                "job_url": row["url"],
+                "job_title": row["title"],
+                "status": row["apply_status"],
+                "timestamp": row["timestamp"],
+                "message": f"Applied: {row['title'] or 'Untitled'}"
+            })
     
     # Sort all activities by timestamp
     activities.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
