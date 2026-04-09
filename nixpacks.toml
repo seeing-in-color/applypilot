@@ -1,0 +1,5 @@
+# Let Nixpacks auto-detect Python from requirements.txt
+# Procfile defines the start command
+
+[variables]
+PYTHONPATH = "/app/src"
