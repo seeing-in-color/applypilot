@@ -8,6 +8,7 @@ for better model behavior.
 
 import logging
 import math
+import os
 import re
 import sqlite3
 import time
@@ -758,7 +759,7 @@ def print_scoring_candidate_profile(candidate_profile: str) -> None:
     console.print(
         Panel(
             candidate_profile,
-            title="Candidate profile (used for scoring)",
+            title="Condensed candidate profile (this text vs job posting)",
             border_style="cyan",
             expand=False,
         )
@@ -766,6 +767,29 @@ def print_scoring_candidate_profile(candidate_profile: str) -> None:
     console.print(
         f"[dim]Length: {len(candidate_profile)} / {SCORE_MAX_PROFILE_CHARS} chars[/dim]\n"
     )
+
+
+def _score_print_candidate_profile_enabled() -> bool:
+    """Default on so batch scoring shows one sample profile at the start; set APPLYPILOT_SCORE_PRINT_PROFILE=0 to disable."""
+    v = os.environ.get("APPLYPILOT_SCORE_PRINT_PROFILE", "1").strip().lower()
+    return v not in ("0", "false", "no")
+
+
+def print_candidate_profile_for_scoring_job(
+    job: dict,
+    candidate_profile: str,
+    resume_src: str,
+) -> None:
+    """Print header + condensed profile for one job (same text the LLM uses as CANDIDATE PROFILE)."""
+    title = (job.get("title") or "?").strip()
+    sq = (job.get("search_query") or "").strip()
+    line = f"Candidate profile for scoring — {title[:90]}"
+    console.print()
+    console.rule(f"[bold cyan]{line}[/bold cyan]", style="dim cyan")
+    console.print(f"[dim]Résumé source: {resume_src}[/dim]")
+    if sq:
+        console.print(f"[dim]Discovery keyword: {sq}[/dim]")
+    print_scoring_candidate_profile(candidate_profile)
 
 
 def print_profile_placeholder_warning() -> None:
@@ -1185,6 +1209,7 @@ def run_scoring(
     chunk_delay: float = DEFAULT_SCORE_CHUNK_DELAY_SEC,
     *,
     verbose: bool = False,
+    print_candidate_profile: bool | None = None,
 ) -> dict:
     """Score unscored jobs that have full descriptions.
 
@@ -1198,11 +1223,18 @@ def run_scoring(
         chunk_size: Jobs per chunk before a between-chunk pause (default 25).
         chunk_delay: Seconds to sleep after each chunk except the last (default 5).
         verbose: If True (or module ``SCORE_VERBOSE`` is True), emit full scoring logs.
+        print_candidate_profile: If True, print one condensed résumé summary at the start (first job in queue).
+            If None, use env ``APPLYPILOT_SCORE_PRINT_PROFILE`` (default ``1`` = print). Set to ``0`` to skip.
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
     """
     eff_verbose = verbose or SCORE_VERBOSE
+    eff_print_profile = (
+        print_candidate_profile
+        if print_candidate_profile is not None
+        else _score_print_candidate_profile_enabled()
+    )
     criteria = load_scoring_criteria()
     profile = _load_profile_for_scoring()
     if not profile:
@@ -1218,31 +1250,6 @@ def run_scoring(
     elif profile_has_placeholders(profile):
         print_profile_placeholder_warning()
 
-    default_resume, default_resume_src = ensure_clean_resume_text()
-    if criteria.fallback_to_profile_resume:
-        candidate_profile_preview, resume_chars, profile_chars = build_condensed_candidate_profile(
-            default_resume,
-            profile,
-            search_query=None,
-            from_role_upload=False,
-            criteria=criteria,
-        )
-        print_scoring_candidate_profile(candidate_profile_preview)
-        if eff_verbose:
-            log.info(
-                "Condensed candidate profile (default résumé): resume_input=%d chars -> profile=%d chars (max %d)",
-                resume_chars,
-                profile_chars,
-                SCORE_MAX_PROFILE_CHARS,
-            )
-            log.info("Default résumé source for preview: %s", default_resume_src)
-    else:
-        console.print(
-            "[dim]Sample profile omitted: scoring uses uploaded keyword résumés only (not ~/.applypilot/resume.txt). "
-            "Each job uses its own file + discovery keyword.[/dim]"
-        )
-        if eff_verbose:
-            log.info("Per-job scoring uses role_resumes/ uploads; profile.json is not merged for those rows.")
     if not criteria.fallback_to_profile_resume:
         console.print(
             "[dim]Scoring uses only uploaded keyword résumés (Find jobs → role_resumes/); "
@@ -1306,6 +1313,31 @@ def run_scoring(
             console.print(
                 f"[yellow]Skipping {skipped_upload} job(s) with no uploaded résumé for the discovery keyword.[/yellow]"
             )
+
+    if not jobs:
+        if eff_verbose:
+            log.info("No jobs to score after filters.")
+        return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
+
+    if eff_print_profile:
+        j0 = jobs[0]
+        rt0, src0, from_role0 = resolve_resume_text_for_job(
+            j0,
+            fallback_to_profile=criteria.fallback_to_profile_resume,
+        )
+        if (rt0 or "").strip():
+            cp0, _, _ = build_condensed_candidate_profile(
+                rt0,
+                profile,
+                search_query=j0.get("search_query"),
+                from_role_upload=from_role0,
+                criteria=criteria,
+            )
+            console.print(
+                "[dim]Résumé summary (first job in queue; others may differ). "
+                "Set APPLYPILOT_SCORE_PRINT_PROFILE=0 or --no-score-print-profile to hide.[/dim]"
+            )
+            print_candidate_profile_for_scoring_job(j0, cp0, src0)
 
     cs = max(1, int(chunk_size))
     cd = max(0.0, float(chunk_delay))
@@ -1506,6 +1538,7 @@ def run_score_one(
     title: str | None = None,
     write_db: bool = False,
     verbose: bool = False,
+    print_candidate_profile: bool | None = None,
 ) -> dict:
     """Load profile + one DB job, run ``score_job``, optionally persist scores.
 
@@ -1553,7 +1586,13 @@ def run_score_one(
         from_role_upload=from_role_upload,
         criteria=criteria,
     )
-    print_scoring_candidate_profile(candidate_profile)
+    eff_print = (
+        print_candidate_profile
+        if print_candidate_profile is not None
+        else _score_print_candidate_profile_enabled()
+    )
+    if eff_print:
+        print_candidate_profile_for_scoring_job(job, candidate_profile, resume_source_used)
     if verbose:
         log.info("Resume source used for score-one: %s", resume_source_used)
     result = score_job(candidate_profile, job, criteria=criteria, verbose=verbose)

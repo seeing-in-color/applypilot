@@ -9,13 +9,20 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+from applypilot.config import APP_DIR, SEARCH_CONFIG_PATH
+from applypilot.webui.find_jobs_config import MAX_DISCOVER_PARALLEL, config_with_single_query_from_base
 from applypilot.webui.helpers import repo_root
 
 _tasks: dict[str, dict[str, Any]] = {}
 _running_procs: dict[str, Any] = {}
+# Set while discover-each-slot is starting (no subprocess yet) so cancel can still attach.
+_DISCOVER_SLOTS_PENDING = object()
 
 
 def _pipeline_env() -> dict[str, str]:
@@ -141,7 +148,17 @@ def cancel_pipeline_task(task_id: str) -> dict[str, Any]:
         if t.get("status") != "running":
             return {"ok": False, "detail": "Not running"}
         pid = t.get("pid")
-    if proc is not None:
+    if isinstance(proc, list):
+        for p in proc:
+            if p is None:
+                continue
+            try:
+                p.terminate()
+            except OSError:
+                pass
+    elif proc is _DISCOVER_SLOTS_PENDING:
+        pass
+    elif proc is not None:
         try:
             proc.terminate()
         except OSError:
@@ -171,6 +188,180 @@ def cancel_pipeline_task(task_id: str) -> dict[str, Any]:
                 returncode=-15,
             )
     return {"ok": True}
+
+
+def start_discover_slots_task(queries: list[str], *, parallel: int = 2) -> str:
+    """Run ``discover`` once per search query using a temp YAML (``APPLYPILOT_SEARCHES_YAML``).
+
+    Parallel > 1 runs multiple subprocesses at once (faster; heavier on boards/APIs).
+    Canonical ``~/.applypilot/searches.yaml`` is unchanged (still lists all keywords for uploads).
+    """
+    tid = uuid.uuid4().hex
+    root = repo_root()
+    n = len(queries)
+    pw = max(1, min(MAX_DISCOVER_PARALLEL, int(parallel)))
+    cmd = [sys.executable, "-m", "applypilot", "run", "discover"]
+    _store(
+        tid,
+        status="running",
+        command=["discover-slots", f"{n} queries", f"parallel={pw}"],
+        log="",
+        started_at=time.time(),
+        finished_at=None,
+        returncode=None,
+        error=None,
+        pid=None,
+    )
+
+    def _worker() -> None:
+        lines: list[str] = []
+        log_lock = threading.Lock()
+
+        def append_tail(chunk: str) -> None:
+            with log_lock:
+                lines.append(chunk)
+                tail = "".join(lines[-800:])
+            _store(tid, log=tail)
+
+        rcs: list[int] = []
+
+        try:
+            with _lock:
+                _running_procs[tid] = _DISCOVER_SLOTS_PENDING
+
+            if not SEARCH_CONFIG_PATH.is_file():
+                raise FileNotFoundError("searches.yaml not found — save Find jobs first.")
+
+            base_raw = yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            if not isinstance(base_raw, dict):
+                base_raw = {}
+
+            def run_slot(idx: int, q: str) -> tuple[int, str]:
+                with _lock:
+                    t = _tasks.get(tid)
+                    if t and t.get("status") == "cancelled":
+                        return (1, q)
+                banner = f"\n{'='*60}\n=== Slot {idx + 1}/{n}: {q}\n{'='*60}\n"
+                append_tail(banner)
+                tmp = APP_DIR / f".discover_slot_{tid}_{idx}.yaml"
+                cfg = config_with_single_query_from_base(base_raw, q)
+                tmp.write_text(
+                    yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True, default_flow_style=False),
+                    encoding="utf-8",
+                )
+                pop_kw: dict[str, Any] = {
+                    "cwd": str(root),
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "text": True,
+                    "bufsize": 1,
+                    "env": _pipeline_env(),
+                }
+                env = dict(pop_kw["env"])
+                env["APPLYPILOT_SEARCHES_YAML"] = str(tmp)
+                pop_kw["env"] = env
+                if sys.platform == "win32":
+                    pop_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    pop_kw["start_new_session"] = True
+                proc = subprocess.Popen(cmd, **pop_kw)
+                with _lock:
+                    cur = _running_procs.get(tid)
+                    if cur is _DISCOVER_SLOTS_PENDING:
+                        _running_procs[tid] = [proc]
+                    elif isinstance(cur, list):
+                        cur.append(proc)
+                    else:
+                        _running_procs[tid] = [proc]
+                _store(tid, pid=proc.pid)
+                assert proc.stdout is not None
+                try:
+                    for line in proc.stdout:
+                        with log_lock:
+                            lines.append(line)
+                            tail = "".join(lines[-800:])
+                        _store(tid, log=tail)
+                        with _lock:
+                            t2 = _tasks.get(tid)
+                            if t2 and t2.get("status") == "cancelled":
+                                break
+                finally:
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=60)
+                        except (OSError, subprocess.TimeoutExpired):
+                            try:
+                                proc.kill()
+                            except OSError:
+                                pass
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    with _lock:
+                        cur = _running_procs.get(tid)
+                        if isinstance(cur, list):
+                            try:
+                                cur.remove(proc)
+                            except ValueError:
+                                pass
+                rc = int(proc.returncode if proc.returncode is not None else 1)
+                return (rc, q)
+
+            if pw < 2 or n < 2:
+                for i, q in enumerate(queries):
+                    with _lock:
+                        t = _tasks.get(tid)
+                        if t and t.get("status") == "cancelled":
+                            break
+                    rc, _ = run_slot(i, q)
+                    rcs.append(rc)
+            else:
+                futures_map: dict[Future[tuple[int, str]], int] = {}
+                with ThreadPoolExecutor(max_workers=min(pw, n)) as ex:
+                    for i, q in enumerate(queries):
+                        fut = ex.submit(run_slot, i, q)
+                        futures_map[fut] = i
+                    rcs = [0] * n
+                    for fut in as_completed(futures_map.keys()):
+                        i = futures_map[fut]
+                        try:
+                            rc, _ = fut.result()
+                            rcs[i] = rc
+                        except Exception as e:
+                            rcs[i] = 1
+                            append_tail(f"\n[error] slot {i + 1}: {e}\n")
+
+            with _lock:
+                _running_procs.pop(tid, None)
+            cur = _tasks.get(tid)
+            if cur and cur.get("status") == "cancelled":
+                return
+            bad = [i for i, rc in enumerate(rcs) if rc != 0]
+            overall_rc = 0 if not bad else 1
+            _store(
+                tid,
+                status="done" if overall_rc == 0 else "error",
+                finished_at=time.time(),
+                returncode=overall_rc,
+            )
+        except Exception as e:
+            with _lock:
+                _running_procs.pop(tid, None)
+            cur = _tasks.get(tid)
+            if cur and cur.get("status") == "cancelled":
+                return
+            _store(
+                tid,
+                status="error",
+                finished_at=time.time(),
+                error=str(e),
+                returncode=-1,
+            )
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return tid
 
 
 def build_run_command(body: dict) -> list[str]:

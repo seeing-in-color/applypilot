@@ -43,6 +43,22 @@ async function refreshUsage() {
   } catch (_) {}
 }
 
+async function repairJobSpy() {
+  terminalAppend("\n── " + new Date().toLocaleString() + " ──\n");
+  terminalAppend("Reinstalling python-jobspy (localhost repair)…\n");
+  try {
+    const r = await api("/deps/repair-jobspy", { method: "POST", body: "{}" });
+    const j = await r.json().catch(() => ({}));
+    if (j.log) terminalAppend(j.log);
+    if (j.hint) terminalAppend("\n" + j.hint + "\n");
+    if (!r.ok) terminalAppend("\n" + (apiDetailMessage(j) || "Request failed") + "\n");
+    else if (!j.ok) terminalAppend("\nRepair finished with errors (see log above).\n");
+    else terminalAppend("\nJobSpy repair OK. Try discover again; restart the server if it still fails.\n");
+  } catch (e) {
+    terminalAppend(String(e.message || e) + "\n");
+  }
+}
+
 function toggleTerminalMinimized() {
   const dock = $("#terminal-dock");
   const btn = $("#btn-terminal-toggle");
@@ -109,6 +125,71 @@ async function loadDashboard() {
   }
 }
 
+function resumeSelectOptionsHtml(files, selected) {
+  const opts = ['<option value="">— None —</option>'];
+  const seen = new Set();
+  for (const f of files || []) {
+    const fn = f.filename || "";
+    if (!fn) continue;
+    seen.add(fn);
+    const sel = selected === fn ? " selected" : "";
+    opts.push(`<option value="${escAttr(fn)}"${sel}>${esc(fn)}</option>`);
+  }
+  if (selected && !seen.has(selected)) {
+    opts.push(`<option value="${escAttr(selected)}" selected>${esc(selected)}</option>`);
+  }
+  return opts.join("");
+}
+
+function renderFindSlots(search_slots, files) {
+  const tbody = $("#find-slots-tbody");
+  if (!tbody) return;
+  const rows = Array.isArray(search_slots) && search_slots.length ? search_slots : [];
+  const parts = [];
+  for (let i = 0; i < 10; i++) {
+    const row = rows[i] || {};
+    const q = row.query || "";
+    const rf = row.resume_filename || "";
+    const selHtml = resumeSelectOptionsHtml(files, rf);
+    parts.push(
+      `<tr>
+        <td class="find-slots-num">${i + 1}</td>
+        <td class="find-slots-titles-cell">
+          <input type="text" class="find-slot-title" data-slot="${i}" value="${escAttr(q)}" spellcheck="false" placeholder="Main job title…" />
+          <label class="find-slot-subs-label">Additional search titles <span class="find-hint">(one per line)</span></label>
+          <textarea class="find-slot-subs" data-slot="${i}" rows="3" spellcheck="false" placeholder="e.g. Technical PM"></textarea>
+        </td>
+        <td class="find-slots-resume-cell">
+          <select class="find-slot-resume" data-slot="${i}">${selHtml}</select>
+          <label class="find-slot-upload-label btn btn-ghost btn-tiny">Upload
+            <input type="file" class="find-slot-file" data-slot="${i}" accept=".pdf,.txt,.doc,.docx" />
+          </label>
+        </td>
+      </tr>`,
+    );
+  }
+  tbody.innerHTML = parts.join("");
+  for (let i = 0; i < 10; i++) {
+    const row = rows[i] || {};
+    const ta = document.querySelector(`.find-slot-subs[data-slot="${i}"]`);
+    if (ta) ta.value = row.sub_titles || "";
+  }
+}
+
+function collectSearchSlots() {
+  const out = [];
+  for (let i = 0; i < 10; i++) {
+    const t = document.querySelector(`.find-slot-title[data-slot="${i}"]`);
+    const ta = document.querySelector(`.find-slot-subs[data-slot="${i}"]`);
+    const s = document.querySelector(`.find-slot-resume[data-slot="${i}"]`);
+    const q = (t && t.value) || "";
+    const subTitles = (ta && ta.value) || "";
+    const fn = s && s.value ? s.value : null;
+    out.push({ query: q, sub_titles: subTitles, resume_filename: fn });
+  }
+  return out;
+}
+
 async function loadFind() {
   const status = $("#find-status");
   try {
@@ -129,16 +210,20 @@ async function loadFind() {
     if ($("#find-run-smartextract")) $("#find-run-smartextract").checked = f.run_smart_extract !== false;
     if ($("#find-city")) $("#find-city").value = f.city_location || "";
     if ($("#find-include-remote")) $("#find-include-remote").checked = f.include_remote !== false;
-    if ($("#find-main-title")) $("#find-main-title").value = f.main_job_title || "";
-    if ($("#find-additional-titles")) $("#find-additional-titles").value = f.additional_titles || "";
     if ($("#find-results-per-site")) $("#find-results-per-site").value = String(f.results_per_site ?? 100);
     if ($("#find-hours-old")) $("#find-hours-old").value = String(f.hours_old ?? 72);
     if ($("#find-country")) $("#find-country").value = f.country || "USA";
+    let files = [];
+    try {
+      const rr = await api("/role-resumes");
+      const jr = await rr.json();
+      files = jr.files || [];
+    } catch (_) {}
+    renderFindSlots(f.search_slots || [], files);
     if (status) status.textContent = "Loaded.";
   } catch (e) {
     if (status) status.textContent = String(e.message || e);
   }
-  syncResumeAllUi();
 }
 
 function collectFindBoards() {
@@ -153,8 +238,7 @@ function collectFindJobsBody() {
     run_smart_extract: $("#find-run-smartextract") ? $("#find-run-smartextract").checked : true,
     city_location: ($("#find-city") && $("#find-city").value) || "",
     include_remote: $("#find-include-remote") ? $("#find-include-remote").checked : true,
-    main_job_title: ($("#find-main-title") && $("#find-main-title").value) || "",
-    additional_titles: ($("#find-additional-titles") && $("#find-additional-titles").value) || "",
+    search_slots: collectSearchSlots(),
     results_per_site: parseInt(($("#find-results-per-site") && $("#find-results-per-site").value) || "100", 10),
     hours_old: parseInt(($("#find-hours-old") && $("#find-hours-old").value) || "72", 10),
     country: ($("#find-country") && $("#find-country").value) || "USA",
@@ -257,6 +341,31 @@ async function runDiscover() {
   }
 }
 
+async function runDiscoverEachSlot() {
+  const status = $("#find-status");
+  if (status) status.textContent = "Saving…";
+  try {
+    await saveFindJobsInternal();
+    if (status) status.textContent = "Starting discover (each slot)…";
+    terminalAppend("\n── " + new Date().toLocaleString() + " ──\n");
+    const r = await api("/pipeline/discover-slots", { method: "POST", body: "{}" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiDetailMessage(j) || r.statusText || "Run failed");
+    const tid = j.task_id;
+    const nq = (j.queries && j.queries.length) || 0;
+    const pw = j.parallel != null ? j.parallel : Math.min(15, nq || 1);
+    const pre = `discover-slots (${nq} queries, parallel=${pw} auto)\n\n`;
+    pollTask(tid, pre, {
+      statusEl: "#find-status",
+      okText: "Discover (each slot) finished.",
+      errText: "Discover (each slot) finished with errors.",
+    });
+  } catch (e) {
+    if (status) status.textContent = String(e.message || e);
+    terminalAppend(String(e.message || e) + "\n");
+  }
+}
+
 async function loadScore() {
   const status = $("#score-status");
   try {
@@ -342,6 +451,8 @@ let resultsHasMore = true;
 let resultsLoading = false;
 let resultsScrollObserver = null;
 let filterDebounceTimer = null;
+/** Sort from Results table Score column only: score_desc | score_asc */
+let resultsSortScore = "score_desc";
 
 function trackSelectValue(raw) {
   const t = String(raw || "")
@@ -410,18 +521,32 @@ function ensureResultsObserver() {
 function resultsQueryParams() {
   const q = ($("#filter-q") && $("#filter-q").value) || "";
   const site = ($("#filter-site") && $("#filter-site").value) || "";
-  const minSc = ($("#filter-min") && $("#filter-min").value) || "";
-  const track = ($("#filter-track") && $("#filter-track").value) || "";
-  const sort = ($("#results-sort") && $("#results-sort").value) || "score_desc";
   const params = new URLSearchParams({
     limit: String(RESULTS_PAGE),
-    sort,
+    sort: resultsSortScore,
   });
   if (q.trim()) params.set("q", q.trim());
   if (site) params.set("site", site);
-  if (minSc !== "") params.set("min_score", minSc);
-  if (track) params.set("application_track", track);
   return params;
+}
+
+function syncResultsScoreSortUi() {
+  const th = $("#results-th-score-col");
+  const btn = $("#results-th-score");
+  const ind = btn && btn.querySelector(".results-th-sort-indicator");
+  if (th) th.setAttribute("aria-sort", resultsSortScore === "score_desc" ? "descending" : "ascending");
+  if (ind) ind.textContent = resultsSortScore === "score_desc" ? "↓" : "↑";
+}
+
+function toggleResultsScoreSort() {
+  resultsSortScore = resultsSortScore === "score_desc" ? "score_asc" : "score_desc";
+  syncResultsScoreSortUi();
+  resetAndFetchResults();
+}
+
+function closeResultsActionsMenu() {
+  const det = document.getElementById("results-actions-menu");
+  if (det && det.tagName === "DETAILS") det.open = false;
 }
 
 async function fetchResultsPage(reset) {
@@ -489,6 +614,7 @@ function scheduleResultsRefetch() {
 }
 
 async function loadResults() {
+  syncResultsScoreSortUi();
   await loadResultSites();
   await resetAndFetchResults();
 }
@@ -638,6 +764,7 @@ async function loadSettings() {
 }
 
 async function deleteScoredJobs() {
+  closeResultsActionsMenu();
   if (
     !confirm(
       "Delete every job that has a fit score? Jobs without a score are kept. This cannot be undone.",
@@ -660,6 +787,7 @@ async function deleteScoredJobs() {
 }
 
 async function deleteAllJobs() {
+  closeResultsActionsMenu();
   if (!confirm("Delete ALL jobs from the database? This cannot be undone.")) return;
   const status = $("#results-status");
   if (status) status.textContent = "Deleting…";
@@ -700,53 +828,58 @@ async function postRestart() {
   }
 }
 
-async function uploadResumeFile() {
-  const fileInput = $("#upload-file");
+async function uploadResumeForSlot(fileInput) {
   if (!fileInput || !fileInput.files || !fileInput.files[0]) return;
+  const row = parseInt(fileInput.getAttribute("data-slot"), 10);
   const st = $("#upload-status");
-  if (st) st.textContent = "Saving searches…";
+  const titleInput = document.querySelector(`.find-slot-title[data-slot="${row}"]`);
+  const subTa = document.querySelector(`.find-slot-subs[data-slot="${row}"]`);
+  const main = titleInput && titleInput.value.trim();
+  const firstSub =
+    subTa &&
+    subTa.value
+      .split(/\n/)
+      .map((l) => l.trim())
+      .find(Boolean);
+  const kw = main || firstSub;
+  if (!kw) {
+    if (st) st.textContent = "Enter a main job title or at least one additional title in this row before uploading.";
+    fileInput.value = "";
+    return;
+  }
+  if (st) st.textContent = "Saving…";
   try {
     await saveFindJobsInternal();
   } catch (e) {
-    if (st) st.textContent = "Save failed: " + String(e.message || e);
+    if (st) st.textContent = String(e.message || e);
     fileInput.value = "";
     return;
   }
   if (st) st.textContent = "Uploading…";
-  const allKw = $("#find-resume-all-keywords") && $("#find-resume-all-keywords").checked;
+  const fd = new FormData();
+  fd.append("keyword", kw);
+  fd.append("file", fileInput.files[0]);
   try {
-    if (allKw) {
-      const fd = new FormData();
-      fd.append("file", fileInput.files[0]);
-      const r = await fetch("/api/interests/upload-all", { method: "POST", body: fd });
-      const j = await r.json();
-      if (!r.ok) throw new Error(apiDetailMessage(j));
-      if (st) st.textContent = "Résumé applied to all keywords: " + (j.filename || "");
-    } else {
-      const kw = ($("#upload-keyword") && $("#upload-keyword").value) || "";
-      const fd = new FormData();
-      fd.append("keyword", kw);
-      fd.append("file", fileInput.files[0]);
-      const r = await fetch("/api/interests/upload", { method: "POST", body: fd });
-      const j = await r.json();
-      if (!r.ok) throw new Error(apiDetailMessage(j));
-      if (st) st.textContent = "Saved: " + j.filename;
-    }
+    const r = await fetch("/api/interests/upload", { method: "POST", body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(apiDetailMessage(j));
+    const fn = j.filename;
+    const rr = await api("/role-resumes");
+    const jr = await rr.json();
+    const files = jr.files || [];
+    document.querySelectorAll(".find-slot-resume").forEach((sel) => {
+      const prev = sel.value;
+      const slot = sel.getAttribute("data-slot");
+      sel.innerHTML = resumeSelectOptionsHtml(files, prev);
+      if (slot === String(row) && fn) sel.value = fn;
+    });
+    await saveFindJobsInternal();
+    if (st) st.textContent = fn ? "Saved: " + fn + " (applied to main + extra titles)" : "Uploaded.";
   } catch (e) {
     if (st) st.textContent = String(e.message || e);
   } finally {
     fileInput.value = "";
   }
-}
-
-function syncResumeAllUi() {
-  const all = $("#find-resume-all-keywords");
-  const kw = $("#upload-keyword");
-  if (!all || !kw) return;
-  const on = all.checked;
-  kw.disabled = on;
-  kw.placeholder = on ? "—" : "Keyword";
-  if (on) kw.value = "";
 }
 
 function apiDetailMessage(j) {
@@ -776,8 +909,9 @@ function wireNav() {
   $("#btn-restart") && $("#btn-restart").addEventListener("click", postRestart);
   $("#btn-save-find") && $("#btn-save-find").addEventListener("click", saveFindJobs);
   $("#btn-run-discover") && $("#btn-run-discover").addEventListener("click", runDiscover);
-  $("#find-resume-all-keywords") &&
-    $("#find-resume-all-keywords").addEventListener("change", syncResumeAllUi);
+  $("#btn-run-discover-slots") &&
+    $("#btn-run-discover-slots").addEventListener("click", () => void runDiscoverEachSlot());
+  $("#btn-repair-jobspy") && $("#btn-repair-jobspy").addEventListener("click", () => void repairJobSpy());
   $("#btn-terminal-stop") && $("#btn-terminal-stop").addEventListener("click", () => void stopTerminalPipeline());
   $("#btn-terminal-clear") &&
     $("#btn-terminal-clear").addEventListener("click", () => terminalSet(""));
@@ -787,13 +921,12 @@ function wireNav() {
   $("#btn-delete-scored") && $("#btn-delete-scored").addEventListener("click", deleteScoredJobs);
   $("#btn-delete-all-jobs") && $("#btn-delete-all-jobs").addEventListener("click", deleteAllJobs);
   $("#btn-results-refresh") && $("#btn-results-refresh").addEventListener("click", () => resetAndFetchResults());
-  ["filter-q", "filter-site", "filter-min", "filter-track", "results-sort"].forEach((id) => {
+  ["filter-q", "filter-site"].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
     el.addEventListener(id === "filter-q" ? "input" : "change", () => scheduleResultsRefetch());
   });
   $("#btn-export-html") && $("#btn-export-html").addEventListener("click", exportHtmlDashboard);
-  $("#upload-file") && $("#upload-file").addEventListener("change", () => uploadResumeFile());
   $("#modal-why-close") &&
     $("#modal-why-close").addEventListener("click", () => $("#modal-why").classList.remove("open"));
   $("#modal-why") &&
@@ -806,6 +939,8 @@ function wireResultsSection() {
   const sec = $("#section-results");
   if (!sec || sec.dataset.wired) return;
   sec.dataset.wired = "1";
+  const scoreBtn = $("#results-th-score");
+  if (scoreBtn) scoreBtn.addEventListener("click", () => toggleResultsScoreSort());
   sec.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-why]");
     if (btn) openWhy(btn.getAttribute("data-why"));
@@ -844,11 +979,23 @@ function wireSettingsResumes() {
   });
 }
 
+function wireFindSlotsSection() {
+  const sec = $("#section-find");
+  if (!sec || sec.dataset.slotWired) return;
+  sec.dataset.slotWired = "1";
+  sec.addEventListener("change", (ev) => {
+    const t = ev.target;
+    if (t && t.classList && t.classList.contains("find-slot-file")) {
+      void uploadResumeForSlot(t);
+    }
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   wireNav();
   wireResultsSection();
   wireSettingsResumes();
-  syncResumeAllUi();
+  wireFindSlotsSection();
   loadMeta();
   showSection("dashboard");
   setInterval(refreshUsage, 20000);

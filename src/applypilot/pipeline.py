@@ -134,16 +134,20 @@ def _run_score(
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
     rescore: bool = False,
+    score_print_profile: bool | None = None,
 ) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10 (chunked for API stability)."""
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring(
-            chunk_size=chunk_size,
-            chunk_delay=chunk_delay,
-            verbose=score_verbose,
-            rescore=rescore,
-        )
+        kw: dict = {
+            "chunk_size": chunk_size,
+            "chunk_delay": chunk_delay,
+            "verbose": score_verbose,
+            "rescore": rescore,
+        }
+        if score_print_profile is not None:
+            kw["print_candidate_profile"] = score_print_profile
+        run_scoring(**kw)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
@@ -295,6 +299,7 @@ def _run_stage_streaming(
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
     rescore: bool = False,
+    score_print_profile: bool | None = None,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -314,6 +319,7 @@ def _run_stage_streaming(
         kwargs["chunk_delay"] = chunk_delay
         kwargs["score_verbose"] = score_verbose
         kwargs["rescore"] = rescore
+        kwargs["score_print_profile"] = score_print_profile
 
     upstream = _UPSTREAM[stage]
 
@@ -370,6 +376,7 @@ def _run_sequential(
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
     rescore: bool = False,
+    score_print_profile: bool | None = None,
 ) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
@@ -398,6 +405,7 @@ def _run_sequential(
                 kwargs["chunk_delay"] = chunk_delay
                 kwargs["score_verbose"] = score_verbose
                 kwargs["rescore"] = rescore
+                kwargs["score_print_profile"] = score_print_profile
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -437,6 +445,7 @@ def _run_streaming(
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
     rescore: bool = False,
+    score_print_profile: bool | None = None,
 ) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
@@ -470,6 +479,7 @@ def _run_streaming(
                 chunk_delay,
                 score_verbose,
                 rescore,
+                score_print_profile,
             ),
             name=f"stage-{name}",
             daemon=True,
@@ -522,6 +532,7 @@ def run_pipeline(
     chunk_delay: float = 5.0,
     score_verbose: bool = False,
     rescore: bool = False,
+    score_print_profile: bool | None = None,
 ) -> dict:
     """Run pipeline stages.
 
@@ -535,6 +546,8 @@ def run_pipeline(
         chunk_delay: Seconds to pause between score chunks (default 5).
         score_verbose: Full diagnostic logs for the score stage (prompt sizes, job essentials, chunk summaries).
         rescore: Score stage only: re-score all jobs with descriptions (not just unscored rows).
+        score_print_profile: If True/False, print or hide one condensed résumé summary at the start of scoring.
+            If None, use env APPLYPILOT_SCORE_PRINT_PROFILE (default: print).
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -560,9 +573,11 @@ def run_pipeline(
     console.print(f"  Workers:    {workers}")
     console.print(f"  Validation: {validation_mode}")
     if "score" in ordered:
+        _spp = score_print_profile
+        _spp_s = "env default" if _spp is None else str(_spp)
         console.print(
             f"  Score:      chunk_size={chunk_size}, chunk_delay={chunk_delay}s, verbose={score_verbose}, "
-            f"rescore={rescore}"
+            f"rescore={rescore}, print_profile={_spp_s}"
         )
     console.print(f"  Stages:     {' -> '.join(ordered)}")
 
@@ -589,6 +604,7 @@ def run_pipeline(
             chunk_delay=chunk_delay,
             score_verbose=score_verbose,
             rescore=rescore,
+            score_print_profile=score_print_profile,
         )
     else:
         result = _run_sequential(
@@ -600,6 +616,7 @@ def run_pipeline(
             chunk_delay=chunk_delay,
             score_verbose=score_verbose,
             rescore=rescore,
+            score_print_profile=score_print_profile,
         )
 
     # Summary table

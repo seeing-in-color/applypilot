@@ -135,16 +135,27 @@ def load_profile() -> dict:
     return profile
 
 
+def searches_config_path() -> Path:
+    """Path to searches YAML. Override with ``APPLYPILOT_SEARCHES_YAML`` (used by discover-each-slot)."""
+    override = os.environ.get("APPLYPILOT_SEARCHES_YAML", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return SEARCH_CONFIG_PATH
+
+
 def load_search_config() -> dict:
-    """Load search configuration from ~/.applypilot/searches.yaml."""
+    """Load search configuration from ~/.applypilot/searches.yaml (or env override)."""
     import yaml
-    if not SEARCH_CONFIG_PATH.exists():
-        # Fall back to package-shipped example
-        example = CONFIG_DIR / "searches.example.yaml"
-        if example.exists():
-            return yaml.safe_load(example.read_text(encoding="utf-8"))
+
+    path = searches_config_path()
+    if not path.is_file():
+        # Example fallback only for default user path (not for explicit temp override).
+        if not os.environ.get("APPLYPILOT_SEARCHES_YAML", "").strip():
+            example = CONFIG_DIR / "searches.example.yaml"
+            if example.exists():
+                return yaml.safe_load(example.read_text(encoding="utf-8")) or {}
         return {}
-    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
 def load_sites_config() -> dict:

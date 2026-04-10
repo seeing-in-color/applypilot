@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -40,8 +41,10 @@ from applypilot.database import (
     set_application_track,
 )
 from applypilot.job_interests import (
+    JobInterestsFile,
     get_effective_job_interests,
     keyword_interest_id,
+    keywords_from_searches_dict,
     load_job_interests,
     safe_role_resume_path,
     save_job_interests,
@@ -54,14 +57,96 @@ from applypilot.scoring.criteria import (
     save_scoring_criteria,
 )
 from applypilot.scoring.role_resume import uses_role_upload_for_scoring
+from applypilot.discovery.jobspy import PYTHON_JOBSPY_PIP_SPEC
 from applypilot.scoring.scorer import parse_criteria_table_rows, parse_stored_score_reasoning
-from applypilot.webui.find_jobs_config import apply_find_jobs_form_to_cfg, cfg_to_find_jobs_form
+from applypilot.webui.find_jobs_config import (
+    MAX_DISCOVER_PARALLEL,
+    apply_find_jobs_form_to_cfg,
+    cfg_to_find_jobs_form,
+    flatten_slot_queries,
+)
 from applypilot.webui.helpers import client_is_local, repo_root, require_local
-from applypilot.webui.tasks import build_run_command, cancel_pipeline_task, get_task, start_pipeline_task
+from applypilot.webui.tasks import (
+    build_run_command,
+    cancel_pipeline_task,
+    get_task,
+    start_discover_slots_task,
+    start_pipeline_task,
+)
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["api"])
+
+
+def _norm_job_title(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+
+def _slot_sub_lines(s: str) -> list[str]:
+    return [ln.strip() for ln in (s or "").splitlines() if ln.strip()]
+
+
+def _search_slots_for_ui(cfg: dict[str, Any], ji: JobInterestsFile) -> list[dict[str, Any]]:
+    """Ten numbered rows: main title, optional sub-titles (lines), optional résumé (from job interests)."""
+    by_norm: dict[str, str | None] = {}
+    for intr in ji.interests:
+        t = _norm_job_title(intr.title)
+        if t:
+            by_norm[t] = intr.resume_filename
+
+    defaults = cfg.get("defaults") or {}
+    stored = defaults.get("ui_search_slots")
+    if isinstance(stored, list) and len(stored) > 0:
+        out: list[dict[str, Any]] = []
+        for i in range(10):
+            if i < len(stored) and isinstance(stored[i], dict):
+                row = stored[i]
+                query = str(row.get("query") or "")
+                sub_titles = str(row.get("sub_titles") or "")
+                fn = None
+                if query.strip():
+                    fn = by_norm.get(_norm_job_title(query))
+                if fn is None and sub_titles.strip():
+                    for line in _slot_sub_lines(sub_titles):
+                        fn = by_norm.get(_norm_job_title(line))
+                        if fn:
+                            break
+                out.append({"query": query, "sub_titles": sub_titles, "resume_filename": fn})
+            else:
+                out.append({"query": "", "sub_titles": "", "resume_filename": None})
+        return out
+
+    keywords = keywords_from_searches_dict(cfg)
+    out2: list[dict[str, Any]] = []
+    for i in range(10):
+        kw = keywords[i] if i < len(keywords) else ""
+        fn = by_norm.get(_norm_job_title(kw)) if kw else None
+        out2.append({"query": kw, "sub_titles": "", "resume_filename": fn})
+    return out2
+
+
+def _apply_search_slot_resumes(slots: list[Any]) -> None:
+    """Persist per-keyword résumé choices after ``searches.yaml`` + sync (same file for main + sub-titles)."""
+    ji = load_job_interests()
+    for s in slots:
+        if not isinstance(s, dict):
+            continue
+        raw_fn = s.get("resume_filename")
+        fn: str | None
+        if raw_fn is None or (isinstance(raw_fn, str) and not raw_fn.strip()):
+            fn = None
+        else:
+            fn = str(raw_fn).strip()
+            if not safe_role_resume_path(fn):
+                fn = None
+        for q in flatten_slot_queries(s):
+            kid = keyword_interest_id(q)
+            for intr in ji.interests:
+                if intr.id == kid or intr.title.strip().lower() == q.lower():
+                    intr.resume_filename = fn
+                    break
+    save_job_interests(ji)
 
 _JOBS_ORDER_BY: dict[str, str] = {
     "score_desc": "fit_score DESC NULLS LAST, discovered_at DESC",
@@ -284,6 +369,12 @@ def put_searches_yaml(request: Request, body: SearchesYamlBody) -> dict[str, Any
     return {"ok": True, "path": str(SEARCH_CONFIG_PATH)}
 
 
+class SearchSlot(BaseModel):
+    query: str = ""
+    sub_titles: str = ""
+    resume_filename: str | None = None
+
+
 class FindJobsForm(BaseModel):
     boards: list[str] = Field(default_factory=list)
     run_jobspy: bool = True
@@ -296,6 +387,7 @@ class FindJobsForm(BaseModel):
     primary_titles: str = ""
     additional_titles: str = ""
     broad_titles: str = ""
+    search_slots: list[SearchSlot] | None = None
     results_per_site: int = Field(100, ge=1, le=500)
     hours_old: int = Field(72, ge=1, le=720)
     country: str = "USA"
@@ -305,7 +397,16 @@ class FindJobsForm(BaseModel):
 def get_find_jobs_form() -> dict[str, Any]:
     ensure_dirs()
     cfg = load_search_config()
-    return cfg_to_find_jobs_form(cfg if isinstance(cfg, dict) else {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    form = cfg_to_find_jobs_form(cfg)
+    try:
+        sync_job_interests_to_searches()
+    except Exception as e:
+        log.warning("sync_job_interests_to_searches: %s", e)
+    ji = get_effective_job_interests()
+    form["search_slots"] = _search_slots_for_ui(cfg, ji)
+    return form
 
 
 @router.put("/config/find-jobs")
@@ -324,6 +425,11 @@ def put_find_jobs_form(request: Request, body: FindJobsForm) -> dict[str, Any]:
         sync_job_interests_to_searches()
     except Exception as e:
         log.warning("sync_job_interests_to_searches: %s", e)
+    if body.search_slots is not None and len(body.search_slots) > 0:
+        try:
+            _apply_search_slot_resumes([s.model_dump() for s in body.search_slots])
+        except Exception as e:
+            log.warning("apply search slot resumes: %s", e)
     return {"ok": True, "path": str(SEARCH_CONFIG_PATH)}
 
 
@@ -527,6 +633,27 @@ def post_pipeline_run(request: Request, body: PipelineBody) -> dict[str, Any]:
     return {"ok": True, "task_id": tid, "command": cmd}
 
 
+@router.post("/pipeline/discover-slots")
+def post_discover_slots(request: Request) -> dict[str, Any]:
+    """Run discover once per saved query; parallelism is ``min(cap, number of queries)`` (no client setting)."""
+    require_local(request)
+    ensure_dirs()
+    if not SEARCH_CONFIG_PATH.is_file():
+        raise HTTPException(400, "Save Find jobs first (searches.yaml missing).")
+    raw = yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    queries = keywords_from_searches_dict(raw if isinstance(raw, dict) else {})
+    if not queries:
+        raise HTTPException(400, "No search queries in saved config.")
+    parallel = min(MAX_DISCOVER_PARALLEL, len(queries))
+    tid = start_discover_slots_task(queries, parallel=parallel)
+    return {
+        "ok": True,
+        "task_id": tid,
+        "queries": queries,
+        "parallel": parallel,
+    }
+
+
 @router.get("/tasks/{task_id}")
 def get_task_status(task_id: str) -> dict[str, Any]:
     t = get_task(task_id)
@@ -550,6 +677,179 @@ def post_export_html_dashboard(request: Request) -> dict[str, Any]:
         raise HTTPException(500, str(e)) from e
     path = generate_dashboard()
     return {"ok": True, "path": path}
+
+
+def _venv_has_pip() -> bool:
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return r.returncode == 0
+
+
+@router.post("/deps/repair-jobspy")
+def post_repair_jobspy(request: Request) -> dict[str, Any]:
+    """Reinstall ``python-jobspy`` into the same interpreter as this server (localhost only).
+
+    ``uv``-managed venvs often have no ``pip`` module. When ``uv`` is on PATH we use
+    ``uv pip install --python <this interpreter>`` (no ``python -m pip`` required). Otherwise we
+    use ``pip`` or bootstrap it with ``ensurepip``.
+    """
+    require_local(request)
+    root = repo_root()
+    chunks: list[str] = []
+
+    py = str(sys.executable)
+    uv_bin = shutil.which("uv")
+    reinstall_ok = False
+    install_method = ""
+
+    if uv_bin and (root / "uv.lock").is_file():
+        r_uv = subprocess.run(
+            [uv_bin, "sync", "--reinstall-package", "python-jobspy"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        chunks.append("$ uv sync --reinstall-package python-jobspy\n")
+        chunks.append((r_uv.stdout or "") + (r_uv.stderr or ""))
+        if r_uv.returncode != 0:
+            chunks.append(f"\n(uv sync exited {r_uv.returncode}; continuing…)\n\n")
+    elif uv_bin:
+        chunks.append("(No uv.lock in project; skipped uv sync.)\n\n")
+    else:
+        chunks.append("(uv not on PATH; skipped uv sync.)\n\n")
+
+    if uv_bin:
+        subprocess.run(
+            [uv_bin, "pip", "uninstall", "--python", py, "jobspy"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        uv_pip_cmd = [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            py,
+            "--reinstall",
+            PYTHON_JOBSPY_PIP_SPEC,
+        ]
+        r_uv_pip = subprocess.run(
+            uv_pip_cmd,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        chunks.append(f"$ {' '.join(uv_pip_cmd)}\n")
+        chunks.append((r_uv_pip.stdout or "") + (r_uv_pip.stderr or ""))
+        if r_uv_pip.returncode == 0:
+            reinstall_ok = True
+            install_method = "uv-pip"
+
+    if not reinstall_ok and _venv_has_pip():
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "jobspy"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        pip_cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            PYTHON_JOBSPY_PIP_SPEC,
+        ]
+        r_pip = subprocess.run(
+            pip_cmd,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        chunks.append(f"$ {' '.join(pip_cmd)}\n")
+        chunks.append((r_pip.stdout or "") + (r_pip.stderr or ""))
+        if r_pip.returncode == 0:
+            reinstall_ok = True
+            install_method = "pip"
+
+    if not reinstall_ok and not _venv_has_pip():
+        chunks.append("\n--- bootstrap pip (ensurepip) ---\n")
+        r_ensure = subprocess.run(
+            [sys.executable, "-m", "ensurepip", "--upgrade"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        chunks.append((r_ensure.stdout or "") + (r_ensure.stderr or ""))
+        if r_ensure.returncode == 0 and _venv_has_pip():
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "jobspy"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            pip_cmd2 = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--force-reinstall",
+                PYTHON_JOBSPY_PIP_SPEC,
+            ]
+            r_pip2 = subprocess.run(
+                pip_cmd2,
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            chunks.append(f"$ {' '.join(pip_cmd2)}\n")
+            chunks.append((r_pip2.stdout or "") + (r_pip2.stderr or ""))
+            if r_pip2.returncode == 0:
+                reinstall_ok = True
+                install_method = "ensurepip+pip"
+
+    if not reinstall_ok:
+        chunks.append(
+            "\nCould not reinstall python-jobspy. Install Astral's uv (https://github.com/astral-sh/uv) "
+            "or ensure `pip` is available in this venv, then try Fix JobSpy again.\n"
+        )
+        log.warning("repair-jobspy: no install method succeeded")
+
+    check = subprocess.run(
+        [sys.executable, "-c", "from jobspy import scrape_jobs; print('jobspy_import_ok')"],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    verify_ok = check.returncode == 0 and "jobspy_import_ok" in (check.stdout or "")
+    chunks.append("\n--- import check ---\n")
+    chunks.append((check.stdout or "") + (check.stderr or ""))
+
+    full_log = "".join(chunks)
+    if reinstall_ok and not verify_ok:
+        log.warning("repair-jobspy: import check failed after reinstall (%s)", install_method)
+
+    return {
+        "ok": reinstall_ok and verify_ok,
+        "pip_ok": reinstall_ok,
+        "install_method": install_method,
+        "verify_ok": verify_ok,
+        "log": full_log,
+        "hint": "If discover still fails, use Restart server so Python reloads site-packages.",
+    }
 
 
 @router.post("/server/restart")

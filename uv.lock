@@ -88,8 +88,8 @@ requires-dist = [
     { name = "pypdf" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "python-dotenv", specifier = ">=1.0" },
-    { name = "python-jobspy", specifier = ">=1.1.0" },
-    { name = "python-jobspy", marker = "extra == 'discover'", specifier = ">=1.1.0" },
+    { name = "python-jobspy", specifier = ">=1.1.0,!=1.1.82" },
+    { name = "python-jobspy", marker = "extra == 'discover'", specifier = ">=1.1.0,!=1.1.82" },
     { name = "python-multipart", marker = "extra == 'webui'", specifier = ">=0.0.9" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "reportlab" },
@@ -921,7 +921,7 @@ wheels = [
 
 [[package]]
 name = "python-jobspy"
-version = "1.1.82"
+version = "1.1.80"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -933,9 +933,9 @@ dependencies = [
     { name = "requests" },
     { name = "tls-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a4/b2/c909850134f45751aeb49075afa4121a2952f627030367dd683a43eb6781/python_jobspy-1.1.82.tar.gz", hash = "sha256:32efb486da5eb60dc54a574bb4a1fb66838fdee75699a7a601aae763637dc8ea", size = 42388, upload-time = "2025-07-28T15:18:56.126Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/4d/1a002ae45a182de3b9c205858704d069dd7dc44e2f7dfcf876c565e7f0ed/python_jobspy-1.1.80.tar.gz", hash = "sha256:8536579101e2c1fbb2e94bd8c509420e90425cef8962a06464418efc414010e4", size = 38487, upload-time = "2025-03-30T20:19:37.95Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d5/2b/18863fcd3c544a69d81e351381a50036a33c21b61cc1c6de2a8f25931237/python_jobspy-1.1.82-py3-none-any.whl", hash = "sha256:93d638b35ffd30a714253e065907f68c5bac624e3937a3ad2ba09f618a072ee9", size = 52833, upload-time = "2025-07-28T15:18:54.84Z" },
+    { url = "https://files.pythonhosted.org/packages/17/24/96d8d1b8bdb676dd9992e7768a6f7c27c6b78752ecd59c7f04bbecf8c938/python_jobspy-1.1.80-py3-none-any.whl", hash = "sha256:19881a6939eaa5ce70a7c7012ec437d0a088b33c80405f207f236cec85ddc9af", size = 47317, upload-time = "2025-03-30T20:19:36.86Z" },
 ]
 
 [[package]]

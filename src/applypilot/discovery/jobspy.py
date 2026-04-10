@@ -8,7 +8,6 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
-import site
 import sqlite3
 import sys
 import time
@@ -30,66 +29,38 @@ _scrape_jobs_fn = None
 
 _KNOWN_GLASSDOOR_API_ERROR = "glassdoor: error encountered in api response"
 
+# PyPI spec for pip/uv (must stay aligned with ``pyproject.toml``).
+PYTHON_JOBSPY_PIP_SPEC = "python-jobspy>=1.1.0,!=1.1.82"
 
-def _iter_site_packages() -> list[Path]:
-    roots: list[Path] = []
-    for prefix in {sys.prefix, getattr(sys, "base_prefix", sys.prefix)}:
-        v = f"{sys.version_info.major}.{sys.version_info.minor}"
-        roots.append(Path(prefix) / "lib" / f"python{v}" / "site-packages")
-    try:
-        roots.extend(Path(p) for p in site.getsitepackages())
-    except Exception:
-        pass
-    try:
-        u = site.getusersitepackages()
-        if isinstance(u, str) and u:
-            roots.append(Path(u))
-    except Exception:
-        pass
-    return [p for p in roots if p.is_dir()]
+_JOBSPY_INSTALL_HELP = """\
+JobSpy (PyPI: python-jobspy, import name: jobspy) is missing or broken.
+Common causes: wrong package (`pip install jobspy` is not this project), or a corrupt/partial
+install (e.g. site-packages/jobspy/ missing indeed.py, bayt.py, linkedin.py, …).
+
+Fix (pick one):
+  uv sync --reinstall-package python-jobspy
+  pip install --force-reinstall 'python-jobspy>=1.1.0,!=1.1.82'
+  pip uninstall -y jobspy python-jobspy && pip install 'python-jobspy>=1.1.0,!=1.1.82'
+
+From the web UI (localhost): use **Fix JobSpy** in the terminal bar to reinstall into this Python.
+
+Then re-run discover (restart the server if imports were cached)."""
 
 
 def _ensure_python_jobspy() -> None:
-    """Raise if a broken ``jobspy`` tree is on disk (wrong PyPI package).
-
-    The real scraper is published as **python-jobspy** on PyPI (imports as ``jobspy``).
-    A partial or name-collision install can leave ``jobspy/__init__.py`` importing
-    ``jobspy.bayt`` without shipping ``bayt.py``.
-    """
-    for root in _iter_site_packages():
-        jd = root / "jobspy"
-        if not jd.is_dir() or not (jd / "__init__.py").is_file():
-            continue
-        has_bayt = (jd / "bayt.py").is_file() or (jd / "bayt").is_dir()
-        if not has_bayt:
-            raise RuntimeError(
-                "JobSpy install is incomplete: `jobspy.bayt` is missing under site-packages/jobspy/. "
-                "Common causes: (1) the wrong PyPI package named `jobspy` was installed instead of "
-                "`python-jobspy`; (2) a partial/corrupt install; (3) an old venv never had dependencies synced.\n\n"
-                "Fix (use one):\n"
-                "  uv sync\n"
-                "  # or: pip install --force-reinstall 'python-jobspy>=1.1.0'\n"
-                "  # if a wrong package is present: pip uninstall jobspy && pip install python-jobspy\n\n"
-                "Then re-run discover."
-            )
-        return
+    """Validate that ``from jobspy import scrape_jobs`` works (real python-jobspy wheel)."""
+    _get_scrape_jobs()
 
 
 def _get_scrape_jobs():
-    """Lazy-import ``scrape_jobs`` after validating the install."""
+    """Lazy-import ``scrape_jobs``; raises ``RuntimeError`` with fix hints if import fails."""
     global _scrape_jobs_fn
     if _scrape_jobs_fn is not None:
         return _scrape_jobs_fn
-    _ensure_python_jobspy()
     try:
         from jobspy import scrape_jobs
-    except ImportError as e:
-        err = str(e).lower()
-        if "jobspy" in err:
-            raise ImportError(
-                "python-jobspy is not installed or broken. Install with: pip install python-jobspy"
-            ) from e
-        raise
+    except (ImportError, ModuleNotFoundError) as e:
+        raise RuntimeError(_JOBSPY_INSTALL_HELP.strip()) from e
     _scrape_jobs_fn = scrape_jobs
     return _scrape_jobs_fn
 

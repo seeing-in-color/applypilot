@@ -45,8 +45,8 @@
         <section id="section-find" class="section">
           <h2>Find jobs</h2>
           <p class="lead find-lead">
-            <code>searches.yaml</code> · main title + additional lines each get a keyword; upload a résumé per keyword on the
-            keyword you type.
+            Up to <strong>10</strong> discovery keywords. Each row is a job title; pick an existing résumé from the list or
+            <strong>Upload</strong> a new file (save runs first). Selections are stored per keyword for scoring.
           </p>
 
           <div class="find-compact panel">
@@ -68,31 +68,19 @@
               </div>
             </div>
 
-            <label class="find-compact__terms-label">Main job title <span class="find-hint">(primary search)</span></label>
-            <input
-              type="text"
-              id="find-main-title"
-              class="find-input-main"
-              spellcheck="false"
-              placeholder="e.g. Staff Software Engineer"
-            />
-            <label class="find-compact__terms-label" style="margin-top: 0.65rem">Additional titles <span class="find-hint">(one per line)</span></label>
-            <textarea id="find-additional-titles" class="find-ta find-ta--main" rows="4" spellcheck="false" placeholder="Extra search queries…"></textarea>
-
-            <div class="find-compact__resumes">
-              <div class="find-compact__h">Résumés <span class="find-hint">optional · uploads when you pick a file</span></div>
-              <label class="find-inline find-inline--mb"
-                ><input type="checkbox" id="find-resume-all-keywords" /> Same file for every keyword</label
-              >
-              <div class="find-upload-row">
-                <input
-                  type="text"
-                  id="upload-keyword"
-                  placeholder="Exact main or additional title"
-                  class="find-input-keyword"
-                  title="Must match main job title or a line under Additional titles"
-                />
-                <input type="file" id="upload-file" accept=".pdf,.txt,.doc,.docx" />
+            <div class="find-slots-wrap">
+              <div class="find-compact__h">Job titles, extra search lines, &amp; résumés</div>
+              <div class="table-wrap find-slots-table-wrap">
+                <table class="data find-slots-table">
+                  <thead>
+                    <tr>
+                      <th class="find-slots-th-num">#</th>
+                      <th>Main title &amp; extra searches</th>
+                      <th class="find-slots-th-resume">Résumé</th>
+                    </tr>
+                  </thead>
+                  <tbody id="find-slots-tbody"></tbody>
+                </table>
               </div>
               <p class="status-bar" id="upload-status"></p>
             </div>
@@ -105,7 +93,10 @@
 
             <div class="find-compact__actions">
               <button type="button" class="btn" id="btn-save-find">Save</button>
-              <button type="button" class="btn" id="btn-run-discover" title="Save, then run discover with the sources checked above">Run discover</button>
+              <button type="button" class="btn" id="btn-run-discover" title="Save, then one discover run with every query at once">Run discover</button>
+              <button type="button" class="btn" id="btn-run-discover-slots" title="Save, then one discover run per saved query; runs up to 15 in parallel automatically">
+                Discover each slot
+              </button>
               <span class="status-bar" id="find-status"></span>
             </div>
           </div>
@@ -156,41 +147,45 @@
             Open <strong>Why</strong> for per-criterion scores. <span class="find-hint">*</span> next to a title means that
             listing was found with a search keyword that has a role-specific résumé uploaded.
           </p>
-          <div class="form-row results-toolbar" style="margin-bottom: 0.75rem; flex-wrap: wrap; align-items: center">
-            <input type="search" id="filter-q" placeholder="Search title…" style="min-width: 180px" />
-            <select id="filter-site"><option value="">All sites</option></select>
-            <input type="number" id="filter-min" placeholder="Min score" min="0" max="10" style="width: 6rem" />
-            <select id="filter-track">
-              <option value="">Any status</option>
-              <option value="unset">No status</option>
-              <option value="open">Open</option>
-              <option value="applied">Applied</option>
-              <option value="follow_up">Follow-up Required</option>
-              <option value="interview">Interview</option>
-            </select>
-            <label class="results-sort-label"
-              >Sort
-              <select id="results-sort">
-                <option value="score_desc">Score (high → low)</option>
-                <option value="score_asc">Score (low → high)</option>
-                <option value="title_asc">Title (A–Z)</option>
-                <option value="title_desc">Title (Z–A)</option>
-                <option value="site_asc">Site (A–Z)</option>
-                <option value="site_desc">Site (Z–A)</option>
-                <option value="discovered_desc">Newest first</option>
-                <option value="discovered_asc">Oldest first</option>
-                <option value="track_asc">Status (A–Z)</option>
-                <option value="track_desc">Status (Z–A)</option>
-              </select></label
-            >
-            <button type="button" class="btn" id="btn-results-refresh">Refresh</button>
-            <span class="results-toolbar__spacer" aria-hidden="true"></span>
-            <button type="button" class="btn btn-danger" id="btn-delete-scored" title="Remove rows that have a fit score">
-              Delete scored
-            </button>
-            <button type="button" class="btn btn-danger" id="btn-delete-all-jobs" title="Remove every job row">
-              Delete all jobs
-            </button>
+          <div class="results-toolbar">
+            <div class="results-search-wrap">
+              <label class="results-search-label" for="filter-q">Search titles</label>
+              <div class="results-search-field">
+                <svg class="results-search-icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"
+                  />
+                </svg>
+                <input
+                  type="search"
+                  id="filter-q"
+                  placeholder="Filter by job title…"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+            </div>
+            <div class="results-toolbar__filters">
+              <label class="results-site-label" for="filter-site">Site</label>
+              <select id="filter-site" class="results-site-select">
+                <option value="">All sites</option>
+              </select>
+            </div>
+            <div class="results-toolbar__actions">
+              <button type="button" class="btn btn-ghost" id="btn-results-refresh">Refresh</button>
+              <details class="results-actions-menu" id="results-actions-menu">
+                <summary class="btn btn-ghost results-actions-summary">Delete…</summary>
+                <div class="results-actions-menu__panel" role="menu">
+                  <button type="button" class="results-actions-menu__item" id="btn-delete-scored" role="menuitem">
+                    Delete scored rows
+                  </button>
+                  <button type="button" class="results-actions-menu__item results-actions-menu__item--danger" id="btn-delete-all-jobs" role="menuitem">
+                    Delete all jobs
+                  </button>
+                </div>
+              </details>
+            </div>
           </div>
           <div class="table-wrap">
             <table class="data">
@@ -198,7 +193,16 @@
                 <tr>
                   <th>Title</th>
                   <th>Site</th>
-                  <th>Score</th>
+                  <th class="results-th-score-wrap" scope="col" id="results-th-score-col" aria-sort="descending">
+                    <button
+                      type="button"
+                      class="results-th-sort"
+                      id="results-th-score"
+                      title="Sort by score — click to reverse"
+                    >
+                      Score <span class="results-th-sort-indicator" aria-hidden="true">↓</span>
+                    </button>
+                  </th>
                   <th>Job search</th>
                   <th>Track</th>
                   <th>Why</th>
@@ -234,9 +238,12 @@
     </div>
 
     <div id="terminal-dock" class="terminal-dock" aria-label="Command output">
-      <div class="terminal-dock__bar">
+        <div class="terminal-dock__bar">
         <span class="terminal-dock__title">Terminal</span>
         <div class="terminal-dock__actions">
+          <button type="button" class="btn btn-ghost btn-tiny" id="btn-repair-jobspy" title="Reinstall python-jobspy into this Python (same env as the server). Use when discover says JobSpy is missing or broken.">
+            Fix JobSpy
+          </button>
           <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-stop" title="Stop the running discover or score process">Stop</button>
           <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-clear" title="Clear output">Clear</button>
           <button type="button" class="btn btn-ghost btn-tiny" id="btn-terminal-toggle" title="Show or hide output">Hide</button>

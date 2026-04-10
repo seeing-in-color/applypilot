@@ -188,6 +188,11 @@ def run(
         "--rescore",
         help="Score stage: re-score every job that has a full description (ignores existing fit_score).",
     ),
+    score_print_profile: bool = typer.Option(
+        True,
+        "--score-print-profile/--no-score-print-profile",
+        help="Score stage: print one condensed résumé summary at the start (sample: first job in queue). Default: on.",
+    ),
     url_fragment: Optional[str] = typer.Option(
         None,
         "--url-fragment",
@@ -275,6 +280,7 @@ def run(
         chunk_delay=chunk_delay,
         score_verbose=score_verbose,
         rescore=rescore,
+        score_print_profile=score_print_profile,
     )
 
     if result.get("errors"):
@@ -677,7 +683,7 @@ def doctor() -> None:
         _ensure_python_jobspy()
         _get_scrape_jobs()
         results.append(("python-jobspy", ok_mark, "Job board scraping available"))
-    except ImportError:
+    except (ImportError, RuntimeError):
         results.append(
             (
                 "python-jobspy",

@@ -31,7 +31,8 @@ dependencies = [
     "openai>=1.40",
     # Job board scraping (PyPI: python-jobspy, imports as jobspy). Core so discover works after any normal install.
     # Do not install the unrelated ``jobspy`` package on PyPI — it breaks imports.
-    "python-jobspy>=1.1.0",
+    # 1.1.82 wheel was published incomplete (missing indeed/, bayt/, etc.); exclude until fixed upstream.
+    "python-jobspy>=1.1.0,!=1.1.82",
     ]
 
 [project.optional-dependencies]
@@ -41,7 +42,7 @@ webui = [
     "python-multipart>=0.0.9",
 ]
 # Kept for backward compatibility; python-jobspy is already a core dependency.
-discover = ["python-jobspy>=1.1.0"]
+discover = ["python-jobspy>=1.1.0,!=1.1.82"]
 dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]

@@ -21,7 +21,7 @@ class ScoringCriteria(BaseModel):
     )
     seniority: bool = Field(
         default=True,
-        description="Weight job YoE/seniority vs profile: stronger penalty when short; boost when at/above or unspecified.",
+        description="Weight job YoE/seniority vs profile: penalty only when below stated minima; meeting or exceeding minimum YoE scores positively (overqualification is good).",
     )
     years_experience: int = Field(default=5, ge=0, le=60)
     filter_travel_over_25: bool = Field(
@@ -129,17 +129,21 @@ The posting is organized into weighted sections (when present):
             f"**Seniority / experience level (very heavy weight on holistic SCORE):** The candidate reports about **{n} years** "
             "of relevant professional experience (approximate). Compare to **explicit** years-of-experience minima in the posting, "
             "title seniority (e.g. Junior vs Principal), and implied level from responsibilities.\n\n"
-            "**Penalty — candidate is short on required YoE:** If the posting clearly requires **more** years than the candidate "
-            f"has (~**{n}**), e.g. **7+ years** required but candidate is **~{n}**, apply a **strong** seniority penalty: "
-            "**lower the holistic SCORE by an extra ~1.0–1.5 points** on top of whatever skill-match alone would suggest. "
-            "For large gaps, overall scores often land in **4–6** unless required skills are an exceptional match (say so in REASONING).\n\n"
-            "**Boost — candidate exceeds the stated minimum YoE:** If the posting states a **minimum** years requirement that is "
-            f"**clearly below** the candidate's level (e.g. requires **2** years and the candidate has **~{n}** with **4–5+** relevant "
-            "years), treat that as a clear seniority advantage: **raise the holistic SCORE by an extra ~0.5–1.0 points** beyond "
-            "skill-match when other dimensions are solid. **Do not** stack bonuses on top of an already-9.\n\n"
-            "**Neutral / mild boost — posting silent on YoE or minimum at candidate level:** If the posting **does not state** a "
-            f"minimum YoE, or the stated minimum is **at** ~**{n}**, seniority should not dominate; a small upward nudge (~0.25–0.5) "
-            "is acceptable when fit is otherwise solid.\n\n"
+            "**Rule — minimum years means a floor, not a target:** If the posting says **minimum** / **at least** / **2+** / "
+            "**N+ years** of experience, anyone with **≥ that many years** (or clearly in range) **meets** the requirement for "
+            "this dimension. **Never** treat \"overqualified\" on years as a gap: having **more** years than the minimum is "
+            "**good** — score the **Seniority / experience** row **7–10** when the candidate **meets or exceeds** the stated "
+            "minimum and title level fits; do **not** write that they \"lack\" experience they clearly exceed.\n\n"
+            "**Penalty — only when below the required YoE:** Apply a seniority penalty **only** if the posting requires **more** "
+            f"years than the candidate plausibly has (~**{n}** or less when the posting demands materially more), e.g. "
+            "**7+ years** required but candidate is **~{n}** with a shortfall. **Lower** holistic SCORE by an extra **~1.0–1.5** "
+            "points in those cases.\n\n"
+            "**Boost — candidate meets or exceeds stated minimum YoE:** If the minimum is **at or below** the candidate's level "
+            f"(e.g. **2+ years** required and candidate has **~{n}**), that is a **positive** signal: **add ~0.5–1.0** to holistic "
+            "SCORE vs skill-match alone when other dimensions are solid. **Exceeding** the minimum (e.g. 5 yrs vs 2+ req) is "
+            "**not** a mismatch — it strengthens fit.\n\n"
+            "**Neutral / mild boost — posting silent on YoE:** If the posting **does not state** a minimum YoE, infer from title "
+            f"and duties; if aligned with ~**{n}**, a small nudge (~0.25–0.5) is fine.\n\n"
             "Reflect seniority in the **Seniority / experience** CRITERIA row **and** move **SCORE** accordingly.\n\n"
         )
 
@@ -166,9 +170,9 @@ def build_score_output_instructions(criteria: ScoringCriteria) -> str:
     seniority_score_note = ""
     if criteria.seniority:
         seniority_score_note = (
-            "\nHolistic **SCORE** must **explicitly** reflect seniority vs stated YoE: **under** the bar → apply the "
-            "**extra ~1.0–1.5** downward adjustment; **clearly above** a stated minimum (e.g. 2 yr req vs 4–5 yr candidate) → "
-            "**extra ~0.5–1.0** upward; silent minimum → at most a small nudge.\n"
+            "\nHolistic **SCORE** must reflect seniority: **below** a stated minimum YoE → **~1.0–1.5** downward; "
+            "**at or above** a stated minimum (including well above, e.g. 5 yrs vs 2+ required) → **~0.5–1.0** upward — "
+            "overqualification on years is **positive**, never a penalty.\n"
         )
 
     return f"""

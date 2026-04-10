@@ -14,9 +14,38 @@ KNOWN_BOARDS: tuple[str, ...] = (
     "google",
 )
 
+# Max concurrent discover subprocesses for "discover each slot" (see routes + tasks).
+MAX_DISCOVER_PARALLEL = 15
+
 
 def _lines(s: str) -> list[str]:
     return [ln.strip() for ln in (s or "").splitlines() if ln.strip()]
+
+
+def flatten_slot_queries(slot: dict[str, Any]) -> list[str]:
+    """Main job title plus sub-titles (one per line), deduped by case-insensitive string."""
+    main = str(slot.get("query") or "").strip()
+    raw = slot.get("sub_titles")
+    if isinstance(raw, list):
+        sub_lines = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        sub_lines = _lines(str(raw or ""))
+    out: list[str] = []
+    seen: set[str] = set()
+    for q in [main] + sub_lines:
+        if not q:
+            continue
+        k = q.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(q)
+    return out
+
+
+def _sub_titles_as_str(raw: Any) -> str:
+    if isinstance(raw, list):
+        return "\n".join(str(x).strip() for x in raw if str(x).strip())
+    return str(raw or "").strip()
 
 
 def cfg_to_find_jobs_form(cfg: dict[str, Any] | None) -> dict[str, Any]:
@@ -126,25 +155,47 @@ def apply_find_jobs_form_to_cfg(form: dict[str, Any], base: dict[str, Any]) -> d
     out["locations"] = locations
 
     queries: list[dict[str, Any]] = []
-    main = str(form.get("main_job_title") or "").strip()
-    addl_lines = _lines(str(form.get("additional_titles") or ""))
-    st = str(form.get("search_terms") or "").strip()
+    slots_used = False
+    slots_in = form.get("search_slots")
+    if isinstance(slots_in, list) and len(slots_in) > 0:
+        slots_used = True
+        slot_rows: list[dict[str, Any]] = []
+        seen_global: set[str] = set()
+        for s in slots_in[:10]:
+            if not isinstance(s, dict):
+                s = {}
+            main = str(s.get("query") or "").strip()
+            sub_str = _sub_titles_as_str(s.get("sub_titles"))
+            slot_rows.append({"query": main, "sub_titles": sub_str})
+            for q in flatten_slot_queries(s):
+                k = q.lower()
+                if k not in seen_global:
+                    seen_global.add(k)
+                    queries.append({"query": q, "tier": 1})
+        while len(slot_rows) < 10:
+            slot_rows.append({"query": "", "sub_titles": ""})
+        out.setdefault("defaults", {})["ui_search_slots"] = slot_rows[:10]
 
-    if main or addl_lines:
-        if main:
-            queries.append({"query": main, "tier": 1})
-        for line in addl_lines:
-            queries.append({"query": line, "tier": 2})
-    elif st:
-        for line in _lines(st):
-            queries.append({"query": line, "tier": 1})
-    else:
-        for line in _lines(str(form.get("primary_titles") or "")):
-            queries.append({"query": line, "tier": 1})
-        for line in _lines(str(form.get("additional_titles") or "")):
-            queries.append({"query": line, "tier": 2})
-        for line in _lines(str(form.get("broad_titles") or "")):
-            queries.append({"query": line, "tier": 3})
+    if not queries and not slots_used:
+        main = str(form.get("main_job_title") or "").strip()
+        addl_lines = _lines(str(form.get("additional_titles") or ""))
+        st = str(form.get("search_terms") or "").strip()
+
+        if main or addl_lines:
+            if main:
+                queries.append({"query": main, "tier": 1})
+            for line in addl_lines:
+                queries.append({"query": line, "tier": 2})
+        elif st:
+            for line in _lines(st):
+                queries.append({"query": line, "tier": 1})
+        else:
+            for line in _lines(str(form.get("primary_titles") or "")):
+                queries.append({"query": line, "tier": 1})
+            for line in _lines(str(form.get("additional_titles") or "")):
+                queries.append({"query": line, "tier": 2})
+            for line in _lines(str(form.get("broad_titles") or "")):
+                queries.append({"query": line, "tier": 3})
     if not queries:
         queries = [{"query": "software engineer", "tier": 1}]
     out["queries"] = queries
@@ -161,4 +212,15 @@ def apply_find_jobs_form_to_cfg(form: dict[str, Any], base: dict[str, Any]) -> d
 
     out["country"] = str(form.get("country") or "USA").strip() or "USA"
 
+    return out
+
+
+def config_with_single_query_from_base(base: dict[str, Any], query: str) -> dict[str, Any]:
+    """Copy ``base`` searches config but keep only one discovery query (for per-slot discover)."""
+    out = deepcopy(base) if base else {}
+    q = (query or "").strip()
+    if not q:
+        out["queries"] = [{"query": "software engineer", "tier": 1}]
+    else:
+        out["queries"] = [{"query": q, "tier": 1}]
     return out
