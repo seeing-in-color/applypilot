@@ -28,7 +28,11 @@ _RATES_PER_MILLION: dict[str, tuple[float, float]] = {
 }
 
 # Fallback when model name not in table: $ per 1M combined tokens (rough)
-_DEFAULT_COMBINED_PER_MILLION = 0.35
+_DEFAULT_COMBINED_PER_MILLION = 0.38
+
+# Applied to raw token×rate math so the UI tends to sit at or slightly above real invoices
+# (rounding, cached-token quirks, tax, and published-rate drift). Tune if your actuals differ.
+CONSERVATIVE_COST_MULTIPLIER = 1.18
 
 
 def _normalize_model_key(model: str) -> str:
@@ -129,7 +133,7 @@ def get_usage_summary() -> dict[str, Any]:
         "updated_at": st.get("updated_at"),
         "by_model": st.get("by_model", {}),
         "path": str(USAGE_PATH),
-        "note": "Estimates from token usage × published-ish $/1M rates; actual billing may differ.",
+        "note": "Conservative estimate: token usage × $/1M rates × buffer; actual provider billing may still differ.",
     }
 
 
